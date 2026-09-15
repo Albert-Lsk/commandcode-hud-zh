@@ -1,7 +1,7 @@
 {
 	"name": "commandcode-hud-zh",
-	"version": "0.1.0",
-	"description": "常驻在 Command Code 输入框下方的上下文仪表盘：上下文进度条、压缩次数、累计花费、工具活动，并在 70/85/90% 主动提醒。",
+	"version": "0.3.0",
+	"description": "Command Code 上下文 HUD：进度条、压缩健康度、大结果预警、精确花费。关注「什么时候会坏」，而不只是「用了多少」。",
 	"keywords": [
 		"commandcode",
 		"commandcode-mod",
