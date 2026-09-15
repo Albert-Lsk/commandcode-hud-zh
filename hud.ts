@@ -161,6 +161,10 @@ const MODEL_PRICE: Record<string, Price> = {
 	'zai-org/GLM-5.3': {in: 1.4, out: 4.4, read: 0.26, write: 1.4},
 };
 
+// 版本号：改功能就 +1。`/hud` 会打出来，用来确认内存里到底跑的是哪一版
+// （mods 每个进程只加载一次，/reload 之前一直在跑旧代码，光看磁盘是看不出来的）。
+const VERSION = '0.2.0';
+
 const FALLBACK_CONTEXT = 1_048_576;
 
 // ── 颜色档位 ──
@@ -761,6 +765,7 @@ export default function (cmd: ModApi): void {
 			}
 			return {
 				message:
+					`commandcode-hud-zh v${VERSION}\n` +
 					`${clean(model, 40) || '(未知模型)'}${effort ? ` · ${clean(effort, 12)}` : ''}\n` +
 					`上下文 ${bar(ratio, 24, barStyle())} ${Math.round(ratio * 100)}%  ` +
 					`${human(contextTokens)} / ${human(lim)}\n` +
