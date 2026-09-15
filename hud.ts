@@ -163,7 +163,7 @@ const MODEL_PRICE: Record<string, Price> = {
 
 // 版本号：改功能就 +1。`/hud` 会打出来，用来确认内存里到底跑的是哪一版
 // （mods 每个进程只加载一次，/reload 之前一直在跑旧代码，光看磁盘是看不出来的）。
-const VERSION = '0.3.0';
+const VERSION = '0.5.0';
 
 const FALLBACK_CONTEXT = 1_048_576;
 
@@ -218,6 +218,22 @@ function human(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_048_576).toFixed(1)}M`;
 	if (n >= 1_000) return `${Math.round(n / 1000)}k`;
 	return String(Math.round(n));
+}
+
+// 可见宽度：先剥掉 ANSI，再把全角字符按 2 列算。
+// 终端是按列截断的，不这么算会在中文/emoji 处提前撑爆。
+function visibleWidth(s: string): number {
+	const plain = s.replace(/\x1b\[[0-9;]*m/g, '');
+	let w = 0;
+	for (const ch of plain) {
+		const c = ch.codePointAt(0) ?? 0;
+		w += c >= 0x1100 && (c <= 0x115f || c === 0x2329 || c === 0x232a ||
+			(c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+			(c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe6f) ||
+			(c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) ||
+			(c >= 0x1f300 && c <= 0x1f64f) || (c >= 0x1f900 && c <= 0x1f9ff)) ? 2 : 1;
+	}
+	return w;
 }
 
 // 两套字形。块字符（█░）好看，但有些字体/主题会渲染成色块，反而看不出进度。
@@ -389,6 +405,10 @@ export default function (cmd: ModApi): void {
 	let bigChars = 0;
 	let lastBigWarnAt = 0;
 
+	// 诊断用：最近一次渲染的实宽与预算
+	let lastRenderedWidth = 0;
+	let lastBudget = 0;
+
 	// 持久化
 	let writes = 0;
 	let lastWriteAt = 0;
@@ -405,6 +425,10 @@ export default function (cmd: ModApi): void {
 	cmd.addFlag('ctx-limit', {type: 'string', description: '手动指定上下文上限（token 数）'});
 	cmd.addFlag('ctx-width', {type: 'string', description: '进度条宽度，默认 12'});
 	cmd.addFlag('ctx-bar', {type: 'string', description: '进度条字形：block（默认）或 ascii'});
+	cmd.addFlag('max-width', {
+		type: 'string',
+		description: '状态栏可用列数，默认自动探测终端宽度',
+	});
 	cmd.addFlag('big-result-kb', {
 		type: 'string',
 		description: '工具结果超过多少 KB 就预警，默认 100，设 0 关闭',
@@ -423,6 +447,14 @@ export default function (cmd: ModApi): void {
 
 	function barStyle(): 'block' | 'ascii' {
 		return String(cmd.getFlag('ctx-bar') ?? '').toLowerCase() === 'ascii' ? 'ascii' : 'block';
+	}
+
+	// 状态栏可用列数。探测不到（无头/管道）就返回 0 = 不裁。
+	function columns(): number {
+		const o = Number(cmd.getFlag('max-width'));
+		if (Number.isFinite(o) && o > 0) return Math.round(o);
+		const c = Number(process.stdout?.columns);
+		return Number.isFinite(c) && c > 0 ? c : 0;
 	}
 
 	function bigThreshold(): number {
@@ -559,6 +591,12 @@ export default function (cmd: ModApi): void {
 	}
 
 	// ── 渲染 ──
+	//
+	// 状态栏是单行，终端变窄时宿主会直接截断（同类 mod 的做法是让用户手动开 compact）。
+	// 这里改成自动降级：从最全的排法开始试，放不下就依次丢次要信息，
+	// 保底留住「上下文百分比」—— 那才是这个 HUD 存在的理由。
+	type Layout = {barWidth: number; tokens: boolean; show: string[]};
+
 	function render(): void {
 		if (!cmd.ui.capabilities.status) return;
 		hydrate();
@@ -566,39 +604,82 @@ export default function (cmd: ModApi): void {
 		const lim = limit();
 		const ratio = lim > 0 ? contextTokens / lim : 0;
 		const paint = colorFor(ratio);
-		const parts: string[] = [];
+		const pct = `${Math.round(ratio * 100)}%`;
 
-		if (model) {
-			const tag = effort ? `${shortModel(model)}·${clean(effort, 8)}` : shortModel(model);
-			parts.push(ANSI.cyan(`[${tag}]`));
-		}
-
-		if (contextTokens > 0) {
-			parts.push(
-				`${ANSI.dim('ctx')} ${paint(bar(ratio, width(), barStyle()))} ` +
-					`${paint(`${Math.round(ratio * 100)}%`)} ` +
-					ANSI.dim(`${human(contextTokens)}/${human(lim)}`),
-			);
-		} else {
-			parts.push(ANSI.dim('ctx —'));
-		}
-
+		const modelSeg = model
+			? ANSI.cyan(
+					`[${effort ? `${shortModel(model)}·${clean(effort, 8)}` : shortModel(model)}]`,
+				)
+			: '';
 		const cost = costNow();
-		if (cost > 0) parts.push(ANSI.dim(money(cost)));
+		const costSeg = cost > 0 ? ANSI.dim(money(cost)) : '';
+		const compactSeg =
+			compactions > 0
+				? ANSI.magenta(
+						`⇄${compactions}${savedTotal > 0 ? ` −${human(savedTotal)}` : ''}` +
+							(lastCompactIneffective ? ' ⚠' : ''),
+					)
+				: '';
+		const toolSeg = currentTool
+			? ANSI.dim(`⚙ ${clean(currentTool, 18)}`)
+			: toolsThisRun > 0
+				? ANSI.dim(`⚙×${toolsThisRun}`)
+				: '';
 
-		if (compactions > 0) {
-			// ③ 回收量；② 无效时打警告标
-			const saved = savedTotal > 0 ? ` −${human(savedTotal)}` : '';
-			const warn = lastCompactIneffective ? ' ⚠' : '';
-			parts.push(ANSI.magenta(`⇄${compactions}${saved}${warn}`));
+		const ctxSeg = (bw: number, withTokens: boolean): string => {
+			if (contextTokens <= 0) return ANSI.dim('ctx —');
+			return (
+				`${ANSI.dim('ctx')} ${paint(bar(ratio, bw, barStyle()))} ${paint(pct)}` +
+				(withTokens ? ANSI.dim(` ${human(contextTokens)}/${human(lim)}`) : '')
+			);
+		};
+
+		const SEP = ANSI.dim(' │ ');
+		const build = (l: Layout): string => {
+			const parts: string[] = [];
+			if (l.show.includes('model') && modelSeg) parts.push(modelSeg);
+			parts.push(ctxSeg(l.barWidth, l.tokens));
+			if (l.show.includes('cost') && costSeg) parts.push(costSeg);
+			if (l.show.includes('compact') && compactSeg) parts.push(compactSeg);
+			if (l.show.includes('tool') && toolSeg) parts.push(toolSeg);
+			if (running) parts.push(ANSI.dim('…'));
+			return parts.join(SEP);
+		};
+
+		const w = width();
+		const LADDER: Layout[] = [
+			{barWidth: w, tokens: true, show: ['model', 'cost', 'compact', 'tool']},
+			{barWidth: w, tokens: true, show: ['model', 'cost', 'compact']},
+			{barWidth: w, tokens: true, show: ['model', 'compact']},
+			{barWidth: 8, tokens: true, show: ['model', 'compact']},
+			{barWidth: 8, tokens: false, show: ['model', 'compact']},
+			{barWidth: 6, tokens: false, show: ['compact']},
+			{barWidth: 5, tokens: false, show: []},
+		];
+
+		// 宿主的 ModStatusLine 是 <Box paddingLeft={2}><Text wrap="truncate">，
+		// 所以真正可用的内容宽度是「终端列数 − 2」，而不是终端列数。
+		// 早先按 −1 算，窄窗口下会照样被截掉尾巴。
+		const cols = columns();
+		let out: string;
+		if (cols <= 0) {
+			out = build(LADDER[0]); // 探测不到宽度（无头/管道）：不裁
+			lastBudget = 0;
+		} else {
+			const budget = Math.max(8, cols - 2);
+			lastBudget = budget;
+			out = build(LADDER[LADDER.length - 1]); // 全都放不下时用最窄的
+			for (const l of LADDER) {
+				const candidate = build(l);
+				if (visibleWidth(candidate) <= budget) {
+					out = candidate;
+					break;
+				}
+			}
 		}
+		lastRenderedWidth = visibleWidth(out);
 
-		if (currentTool) parts.push(ANSI.dim(`⚙ ${clean(currentTool, 18)}`));
-		else if (toolsThisRun > 0) parts.push(ANSI.dim(`⚙×${toolsThisRun}`));
-
-		if (running) parts.push(ANSI.dim('…'));
-
-		cmd.ui.setStatus(parts.join(ANSI.dim(' │ ')));
+		cmd.ui.setStatus(out);
 	}
 
 	// ── 阈值提醒 ──
@@ -792,7 +873,6 @@ export default function (cmd: ModApi): void {
 			}
 			return {
 				message:
-					`commandcode-hud-zh v${VERSION}\n` +
 					`${clean(model, 40) || '(未知模型)'}${effort ? ` · ${clean(effort, 12)}` : ''}\n` +
 					`上下文 ${bar(ratio, 24, barStyle())} ${Math.round(ratio * 100)}%  ` +
 					`${human(contextTokens)} / ${human(lim)}\n` +
@@ -803,6 +883,15 @@ export default function (cmd: ModApi): void {
 					`（阈值 ${Math.round(bigThreshold() / 1024)} KB）\n` +
 					`本轮工具 ${toolsThisRun} 次\n` +
 					`持久化 ${cmd.session ? '✅ 可用' : '❌ 未绑定'}　本进程写入 ${writes} 次　已读回 ${readBack} 条\n` +
+					`v${VERSION}　终端 ${columns() || '未探测'} 列　可用 ${lastBudget || '未探测'} 列　` +
+					`状态栏实宽 ${lastRenderedWidth} 列　` +
+					`${
+						lastBudget <= 0
+							? '（探测不到宽度，不裁）'
+							: lastRenderedWidth > lastBudget
+								? '⚠ 超宽会被截断'
+								: '✅ 不超宽'
+					}\n` +
 					`会话文件 ${log.found ? `✅ ${log.path}` : '❌ 未定位'}`,
 			};
 		},

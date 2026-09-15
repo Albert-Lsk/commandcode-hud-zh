@@ -208,7 +208,8 @@ ok('恢复后花费不为 0（探针反查成功）', !r2.includes('$0 │') && 
 const r2b = strip(cmd2.__status);
 ok('回填：上下文（不再是 ctx —）', !r2b.includes('ctx —') && r2b.includes('29%'));
 ok('回填：模型名', r2b.includes('deepseek-v4.1-flash'));
-ok('/hud 打出版本号', r.message.includes('commandcode-hud-zh v'));
+ok('/hud 打出版本号', /v\d+\.\d+\.\d+/.test(r.message));
+ok('/hud 给出宽度诊断', r.message.includes('终端') && r.message.includes('状态栏实宽'));
 
 // ═══════════ 汇总 ═══════════
 console.log('\n══ 结果 ══');
