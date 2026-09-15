@@ -26,7 +26,22 @@
 2. **`cmd.ui.widget` 还不能用。** 官方文档明确写着 "Widgets are not wired into the TUI yet… they currently render nowhere"。等它接线了，可以把上下文条挪到编辑器上方做多行版。
 3. **模型上下文上限不在 API 里。** 事件只给 `model` 和 `usage`，不给窗口大小。所以上限表是从随包的模型目录生成的，内联在 `hud.ts` 里（66 个模型）。**文档写 "1M"，实际是 2^20 = 1048576** —— 这里按实测值修正过。表里没有的模型回退到 1M，可用 `--mod-option ctx-limit=` 覆盖。
 
+## 和同类 mod 的区别
+
+Command Code 的 HUD/状态栏类 mod 已经有一批（`hu9osaez/commandcode-hud`、`cmd-statusline`、`command-code-mod-session-stats`、`cmd-footer`）。这个的差异只在两点，但两点都是真的：
+
+1. **把压缩次数放上状态栏（`⇄N`）。** 上下文溢出最阴的地方不是"用得慢"，而是**自动压缩会静默跑很多次、界面上毫无提示**，直到某一轮直接 400。别的 HUD 都在告诉你"用了多少"，没人告诉你"已经压了几次"。
+2. **主动提醒，而不只是显示。** 70% / 85% / 90% 各响一次，90% 那次直接给出处置建议（`/compact` 还是 `/clear`）。全中文。
+
+另外刻意做了两件"不做"：**不 patch CLI 的 dist**（CLI 自更新会冲掉，需要反复修）、**不读 `~/.commandcode/auth.json` 也不联网**。
+
 ## 安装
+
+```bash
+cmd mods add Albert-Lsk/commandcode-hud-zh      # 从 GitHub 装
+```
+
+或者手动丢文件：
 
 ```bash
 cp hud.ts ~/.commandcode/mods/commandcode-hud.ts

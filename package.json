@@ -1,5 +1,5 @@
 {
-	"name": "commandcode-hud-cn",
+	"name": "commandcode-hud-zh",
 	"version": "0.1.0",
 	"description": "常驻在 Command Code 输入框下方的上下文仪表盘：上下文进度条、压缩次数、累计花费、工具活动，并在 70/85/90% 主动提醒。",
 	"keywords": [
@@ -24,5 +24,9 @@
 	"scripts": {
 		"test": "node test-hud.ts",
 		"probe:color": "node tools/color-probe.ts"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Albert-Lsk/commandcode-hud-zh.git"
 	}
 }
