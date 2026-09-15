@@ -111,7 +111,10 @@ const cmd1 = makeCmd(h1, c1, n1);
 hud(cmd1);
 h1[0].onSessionStart({source: 'startup'});
 show('冷启动', cmd1.__status);
-ok('冷启动显示 ctx —', strip(cmd1.__status).includes('ctx —'));
+// 有了回填，reload/恢复之后第一次渲染就该有上下文，不再是刺眼的 ctx —
+ok('冷启动即回填上下文（无 ctx —）', !strip(cmd1.__status).includes('ctx —') && strip(cmd1.__status).includes('%'));
+// 全新会话（没有 transcript）才应该是空的
+ok('冷启动也能显示回填的模型名', strip(cmd1.__status).includes('deepseek-v4.1-flash'));
 
 const req = (pct: number, effort = 'high') =>
 	cmd1.__fire('model_request_end', {
@@ -200,6 +203,12 @@ console.log(r.message.split('\n').map((l: string) => '  ' + strip(l)).join('\n')
 ok('/hud 标出花费来源为官方', r.message.includes('官方（会话文件'));
 ok('/hud 标出会话文件已定位', r.message.includes('会话文件 ✅'));
 ok('恢复后花费不为 0（探针反查成功）', !r2.includes('$0 │') && cmd2.__status.includes('$0.350'));
+
+// 回填：reload 后不该再显示刺眼的 ctx —
+const r2b = strip(cmd2.__status);
+ok('回填：上下文（不再是 ctx —）', !r2b.includes('ctx —') && r2b.includes('29%'));
+ok('回填：模型名', r2b.includes('deepseek-v4.1-flash'));
+ok('/hud 打出版本号', r.message.includes('commandcode-hud-zh v'));
 
 // ═══════════ 汇总 ═══════════
 console.log('\n══ 结果 ══');

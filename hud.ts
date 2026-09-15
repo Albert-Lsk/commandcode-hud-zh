@@ -163,7 +163,7 @@ const MODEL_PRICE: Record<string, Price> = {
 
 // 版本号：改功能就 +1。`/hud` 会打出来，用来确认内存里到底跑的是哪一版
 // （mods 每个进程只加载一次，/reload 之前一直在跑旧代码，光看磁盘是看不出来的）。
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 const FALLBACK_CONTEXT = 1_048_576;
 
@@ -259,6 +259,11 @@ class SessionLog {
 	private carry = ''; // 跨读取的半行
 	totalCost = 0;
 	requests = 0;
+	// 顺带记住最后一条 assistant 记录的状态：会话文件里每条都带 model/effort/usage，
+	// 拿它回填，reload 和 resume 之后就不用先显示一个刺眼的 `ctx —`。
+	lastModel = '';
+	lastEffort = '';
+	lastContext = 0;
 
 	constructor(base: string) {
 		this.base = base;
@@ -275,6 +280,9 @@ class SessionLog {
 					this.carry = '';
 					this.totalCost = 0;
 					this.requests = 0;
+					this.lastModel = '';
+					this.lastEffort = '';
+					this.lastContext = 0;
 					return true;
 				}
 			}
@@ -309,9 +317,15 @@ class SessionLog {
 				try {
 					const rec = JSON.parse(line);
 					const u = rec?.usage;
-					if (u && Number.isFinite(u.costUsd)) {
+					if (!u) continue;
+					if (Number.isFinite(u.costUsd)) {
 						this.totalCost += Number(u.costUsd);
 						this.requests += 1;
+					}
+					if (Number.isFinite(u.inputTokens)) {
+						this.lastContext = Number(u.inputTokens) + (Number(u.outputTokens) || 0);
+						if (rec.model) this.lastModel = String(rec.model);
+						if (rec.effort) this.lastEffort = String(rec.effort);
 					}
 				} catch {
 					// 坏行跳过：会话文件本来就容错
@@ -416,6 +430,15 @@ export default function (cmd: ModApi): void {
 		if (v === undefined) return 100 * 1024;
 		const n = Number(v);
 		return Number.isFinite(n) && n >= 0 ? n * 1024 : 100 * 1024;
+	}
+
+	// 把会话文件里读到的状态填进来。只填"还没有"的字段：
+	// 实时事件永远优先，这里只负责 reload / resume 之后的第一眼。
+	function syncFromLog(): void {
+		if (!log.found) return;
+		if (!model && log.lastModel) model = log.lastModel;
+		if (!effort && log.lastEffort) effort = log.lastEffort;
+		if (contextTokens === 0 && log.lastContext > 0) contextTokens = log.lastContext;
 	}
 
 	// 状态栏空间金贵，模型名只显示最后一段（deepseek/deepseek-v4.1-flash → deepseek-v4.1-flash）
@@ -525,6 +548,7 @@ export default function (cmd: ModApi): void {
 					}
 					if (log.locate(name.replace(/\.jsonl$/, ''))) {
 						log.poll();
+						syncFromLog();
 						return;
 					}
 				}
@@ -661,7 +685,8 @@ export default function (cmd: ModApi): void {
 		running = true;
 		toolsThisRun = 0;
 		if (e?.sessionId && log.locate(String(e.sessionId))) {
-			log.poll(); // 首次全量读，resume 也能立刻显示历史花费
+			log.poll(); // 首次全量读：resume 也能立刻显示历史花费与上下文
+			syncFromLog();
 		}
 		render();
 	});
@@ -718,6 +743,7 @@ export default function (cmd: ModApi): void {
 
 	cmd.on('turn_end', () => {
 		log.poll(); // 会话文件在每个 turn 提交后才有新内容
+		syncFromLog();
 		render();
 	});
 
@@ -739,6 +765,7 @@ export default function (cmd: ModApi): void {
 			const fromArgv = sessionIdFromArgv(process.argv);
 			if (fromArgv && log.locate(fromArgv)) log.poll();
 			else adoptSessionByProbe(); // /reload 的情况：靠探针反查
+			syncFromLog();
 			render();
 		},
 		onSessionEnd: () => cmd.ui.setStatus(null),
