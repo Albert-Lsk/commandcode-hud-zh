@@ -63,14 +63,23 @@ const priceRows = Object.keys(price).sort()
 
 let src = readFileSync(join(ROOT, 'hud.ts'), 'utf8');
 
-const ctxBlock = /const MODEL_CONTEXT: Record<string, number> = \{[\s\S]*?\n\};/;
-const priceBlock = /const MODEL_PRICE: Record<string, Price> = \{[\s\S]*?\n\};/;
-if (!ctxBlock.test(src) || !priceBlock.test(src)) {
-	throw new Error('hud.ts 里找不到 MODEL_CONTEXT / MODEL_PRICE 块，结构可能已改');
-}
+// 两种形态都要认：占位符（首次/重写后）和已注入的表（重复运行）
+const ctxOut = `const MODEL_CONTEXT: Record<string, number> = {\n${ctxRows}\n};`;
+const priceOut = `const MODEL_PRICE: Record<string, Price> = {\n${priceRows}\n};`;
 
-src = src.replace(ctxBlock, `const MODEL_CONTEXT: Record<string, number> = {\n${ctxRows}\n};`);
-src = src.replace(priceBlock, `const MODEL_PRICE: Record<string, Price> = {\n${priceRows}\n};`);
+const ctxPlaceholder = '/*__CTX_TABLE__*/';
+const pricePlaceholder = '/*__PRICE_TABLE__*/';
+
+if (src.includes(ctxPlaceholder) || src.includes(pricePlaceholder)) {
+	src = src.replace(ctxPlaceholder, ctxOut).replace(pricePlaceholder, priceOut);
+} else {
+	const ctxBlock = /const MODEL_CONTEXT: Record<string, number> = \{[\s\S]*?\n\};/;
+	const priceBlock = /const MODEL_PRICE: Record<string, Price> = \{[\s\S]*?\n\};/;
+	if (!ctxBlock.test(src) || !priceBlock.test(src)) {
+		throw new Error('hud.ts 里既没有占位符也找不到表块，结构可能已改');
+	}
+	src = src.replace(ctxBlock, ctxOut).replace(priceBlock, priceOut);
+}
 writeFileSync(join(ROOT, 'hud.ts'), src);
 
 writeFileSync(join(ROOT, 'model-context.json'), JSON.stringify(ctx, null, 1) + '\n');

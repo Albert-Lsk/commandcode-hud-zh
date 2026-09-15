@@ -1,17 +1,24 @@
-// commandcode-hud — 常驻上下文仪表盘
+// commandcode-hud-zh — 常驻上下文 HUD（Command Code mod）
 //
-// 参照 jarrodwatts/claude-hud 的思路，改用 Command Code 的 ModApi 实现。
-// 渲染在输入面板下方的常驻状态栏（cmd.ui.setStatus），每一轮对话后自动刷新。
+// 在输入面板下方常驻一行：模型·推理档位 · 上下文进度条 · 花费 · 压缩 · 当前工具。
 //
-// 为什么要有它：上下文溢出是静默发生的——自动压缩会悄悄跑很多次，
-// 界面上没有任何提示，直到某一条消息直接报 400。这个 mod 把那个盲区补上。
+// 设计动机来自一次真实事故：某个 session 的 9 次自动压缩把锚点钉在同一张
+// 389.9 KB 的截图上，压缩彻底失效，上下文地板卡在 4.26 MB，界面上毫无提示，
+// 直到下一轮直接 400。
+//
+// 所以这个 mod 的重点不是「显示用了多少」，而是**在坏掉之前预警**：
+//   ① 大结果预警   —— 什么内容正在永久占位（并可能钉死压缩锚点）
+//   ② 压缩健康度   —— 压完之后上下文有没有真的下降（没降 = 压缩已失效）
+//   ③ 压缩回收量   —— 压缩到底救回了多少
+//   ④ 精确花费     —— 直接读会话文件里 CLI 自己算的 costUsd
+//
+// 刻意不做：不 patch CLI 的 dist、不读 auth.json、不联网。
 
 import type {ModApi} from '@commandcode/harness';
+import {closeSync, existsSync, openSync, readSync, readdirSync, statSync} from 'node:fs';
+import {join} from 'node:path';
+import {homedir} from 'node:os';
 
-// ─────────────────────────────────────────────────────────────
-// 模型 → 上下文上限（由 Command Code 随包的模型目录生成）
-// 注意：文档写 "1M"，实际是 2^20 = 1048576，这里按实测值修正。
-// ─────────────────────────────────────────────────────────────
 const MODEL_CONTEXT: Record<string, number> = {
 	'MiniMaxAI/MiniMax-M2.5': 204800,
 	'MiniMaxAI/MiniMax-M3': 1048576,
@@ -81,11 +88,6 @@ const MODEL_CONTEXT: Record<string, number> = {
 	'zai-org/GLM-5.3': 1048576,
 };
 
-const FALLBACK_CONTEXT = 1_048_576;
-
-// 模型 → 每 1M token 单价（美元）。同样由随包的模型目录生成。
-// 注意：事件里的 usage **没有 costUsd**（会话日志里才有），所以成本得自己算。
-type Price = {in: number; out: number; read: number; write: number};
 const MODEL_PRICE: Record<string, Price> = {
 	'MiniMaxAI/MiniMax-M2.5': {in: 0.3, out: 1.2, read: 0.03, write: 0.3},
 	'MiniMaxAI/MiniMax-M2.7': {in: 0.3, out: 1.2, read: 0.06, write: 0.3},
@@ -159,20 +161,26 @@ const MODEL_PRICE: Record<string, Price> = {
 	'zai-org/GLM-5.3': {in: 1.4, out: 4.4, read: 0.26, write: 1.4},
 };
 
+const FALLBACK_CONTEXT = 1_048_576;
 
-// 颜色档位（所有者指定）
-const P_YELLOW = 0.70; // 70% 起转黄
-const P_RED = 0.90; // 90% 起转红（含）
+// ── 颜色档位 ──
+const P_YELLOW = 0.7; // 70% 起转黄
+const P_RED = 0.9; // 90% 起转红（含）
 
-// 提醒阈值：到这几个点各响一次（每个 session 每档一次）
-// 与颜色档位对齐：70 转黄时提示，90 转红时给出处置建议；85 是中间那道软性的 /compact 提醒。
-const P_WARN = P_YELLOW; // 70
+// ── 提醒阈值（每个 session 每档一次）──
+const P_WARN = P_YELLOW;
 const P_CRIT = 0.85;
-const P_DANGER = P_RED; // 90
+const P_DANGER = P_RED;
+
+// ── 压缩健康度 ──
+// 压缩后上下文至少要降这么多，才认为它真的回收了东西。
+// 事故里的表现是：压了 9 次，地板一动不动。
+const COMPACT_MIN_GAIN = 5_000;
+// 连续这么多次无效就报警
+const COMPACT_INEFFECTIVE_ALERT = 2;
 
 const ANSI = {
 	dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-	bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
 	green: (s: string) => `\x1b[32m${s}\x1b[0m`,
 	yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
 	red: (s: string) => `\x1b[31m${s}\x1b[0m`,
@@ -180,7 +188,11 @@ const ANSI = {
 	cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
 };
 
-// 单行状态栏，控制字符必须清掉，否则会把渲染搞乱
+// ─────────────────────────────────────────────────────────────
+// 纯函数
+// ─────────────────────────────────────────────────────────────
+
+// 状态栏是单行文本，控制字符必须清掉，否则会把渲染搞乱
 function clean(s: unknown, max = 40): string {
 	const t = String(s ?? '')
 		.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
@@ -189,7 +201,7 @@ function clean(s: unknown, max = 40): string {
 	return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
-// 花费：小额不能被 toFixed(2) 吃成 $0.00，否则前面几十轮看着都像没花钱
+// 花费：小额不能被 toFixed(2) 吃成 $0.00
 function money(n: number): string {
 	if (!Number.isFinite(n) || n <= 0) return '$0';
 	if (n < 0.01) return `$${n.toFixed(4)}`;
@@ -204,10 +216,7 @@ function human(n: number): string {
 	return String(Math.round(n));
 }
 
-// 进度条：多宽都行，等宽字符保证对齐
-//
-// 两套字形。块字符（█░）好看，但依赖终端字体正确渲染 —— 有些字体/主题会把它
-// 渲染成色块或点阵，反而看不出进度。ascii 版用 # 和 -，任何环境都不会出错。
+// 两套字形。块字符（█░）好看，但有些字体/主题会渲染成色块，反而看不出进度。
 function bar(ratio: number, width = 12, style: 'block' | 'ascii' = 'block'): string {
 	const clamped = Math.max(0, Math.min(1, ratio));
 	const filled = Math.round(clamped * width);
@@ -215,25 +224,218 @@ function bar(ratio: number, width = 12, style: 'block' | 'ascii' = 'block'): str
 	return on.repeat(filled) + off.repeat(width - filled);
 }
 
+// 事件里的 usage 不带 costUsd，按单价估算（仅在读不到会话文件时兜底）。
+// 口径：inputTokens 已含 cacheRead（OpenAI 口径），先拆出未缓存部分再计价。
+function estimateCost(u: any, model: string): number {
+	const p = MODEL_PRICE[model];
+	if (!p) return 0;
+	const input = Number(u?.inputTokens) || 0;
+	const read = Number(u?.cacheReadTokens) || 0;
+	const write = Number(u?.cacheWriteTokens) || 0;
+	const out = Number(u?.outputTokens) || 0;
+	const uncached = Math.max(0, input - read - write);
+	return (uncached * p.in + read * p.read + write * p.write + out * p.out) / 1_000_000;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 会话文件增量读取（精确花费）
+//
+// mod 拿不到当前 session id，但 run_start 会给出；文件名就是 <id>.jsonl，
+// 放在 ~/.commandcode/projects/<slug>/ 下。直接扫目录比推算 slug 稳。
+// 会话文件里每条 assistant 记录带 CLI 自己算的 usage.costUsd —— 那是官方数字，
+// 比本地按价目表估算准，而且不会随模型目录漂移。
+// ─────────────────────────────────────────────────────────────
+class SessionLog {
+	// 注意：这里不用 TS 的参数属性简写（constructor(private base: string)）。
+	// Node 的类型剥离（strip-only）不支持它，会直接抛 ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX，
+	// 那样就没法用 node 直接跑本文件和测试台了。全文件只用可擦除语法。
+	private readonly base: string;
+	private file: string | null = null;
+	private offset = 0;
+	private carry = ''; // 跨读取的半行
+	totalCost = 0;
+	requests = 0;
+
+	constructor(base: string) {
+		this.base = base;
+	}
+
+	locate(sessionId: string): boolean {
+		if (!sessionId) return false;
+		try {
+			for (const slug of readdirSync(this.base)) {
+				const p = join(this.base, slug, `${sessionId}.jsonl`);
+				if (existsSync(p)) {
+					this.file = p;
+					this.offset = 0;
+					this.carry = '';
+					this.totalCost = 0;
+					this.requests = 0;
+					return true;
+				}
+			}
+		} catch {
+			// 目录不存在等情况：当作读不到
+		}
+		return false;
+	}
+
+	/** 增量读一次。返回是否真的读到了新字节。 */
+	poll(): boolean {
+		if (!this.file) return false;
+		try {
+			const size = statSync(this.file).size;
+			if (size < this.offset) {
+				// 文件被换掉或截断：从头重来
+				this.offset = 0;
+				this.carry = '';
+			}
+			if (size === this.offset) return false;
+
+			const fd = openSync(this.file, 'r');
+			const buf = Buffer.alloc(size - this.offset);
+			readSync(fd, buf, 0, buf.length, this.offset);
+			closeSync(fd);
+			this.offset = size;
+
+			const lines = (this.carry + buf.toString('utf8')).split('\n');
+			this.carry = lines.pop() ?? ''; // 最后一段可能是半行
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				try {
+					const rec = JSON.parse(line);
+					const u = rec?.usage;
+					if (u && Number.isFinite(u.costUsd)) {
+						this.totalCost += Number(u.costUsd);
+						this.requests += 1;
+					}
+				} catch {
+					// 坏行跳过：会话文件本来就容错
+				}
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	get found(): boolean {
+		return this.file !== null;
+	}
+	get path(): string {
+		return this.file ?? '';
+	}
+}
+
+// 从启动参数里捞 session id —— 让 --resume 的会话一打开就能显示历史花费
+function sessionIdFromArgv(argv: readonly string[]): string {
+	const looksLikeId = (v: string) => /^[0-9a-f][0-9a-f-]{7,}$/i.test(v);
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i];
+		if (a === '--resume' || a === '-r' || a === '--session' || a === '--sessions') {
+			const v = argv[i + 1];
+			if (v && !v.startsWith('-') && looksLikeId(v)) return v;
+		}
+		if (a.startsWith('--resume=') || a.startsWith('--session=')) {
+			const v = a.split('=')[1] ?? '';
+			if (looksLikeId(v)) return v;
+		}
+	}
+	return '';
+}
+
+// ─────────────────────────────────────────────────────────────
+// mod 本体
+// ─────────────────────────────────────────────────────────────
+
 export default function (cmd: ModApi): void {
-	// ── 运行态（闭包，不持久化）──
+	// ── 运行态 ──
 	let model = '';
-	let effort = ''; // 推理档位，事件 payload 里白送的
-	let contextTokens = 0; // 最近一次请求的 inputTokens = 当前上下文大小
-	let costUsd = 0; // 本 session 累计花费
+	let effort = '';
+	let contextTokens = 0;
+	let estimatedCost = 0; // 价目表估算（兜底用）
 	let compactions = 0;
+	let savedTotal = 0; // 压缩累计回收的 token（③）
 	let currentTool: string | null = null;
 	let toolsThisRun = 0;
 	let running = false;
-	const fired = new Set<string>(); // 已触发过的阈值提醒
-	let hydrated = false; // 是否已从会话存储恢复过
-	let writes = 0; // 本进程成功写入的状态条目数
-	let lastWriteAt = 0; // 节流用
+	let hydrated = false;
 
-	// ── 持久化：让 HUD 熬过 /reload 和 --resume ──
-	// mods 是每个进程加载一次的，闭包里的计数器活不过 reload。
-	// cmd.session 是官方给的持久化接缝，写进去的东西不会被送给模型。
+	// 压缩健康度（②）
+	let pendingCompactBefore = 0; // 压缩前的上下文
+	let ineffectiveCompactions = 0; // 连续无效次数
+	let lastCompactIneffective = false;
+
+	// 大结果预警（①）
+	let bigResults = 0;
+	let bigChars = 0;
+	let lastBigWarnAt = 0;
+
+	// 持久化
+	let writes = 0;
+	let lastWriteAt = 0;
+	let hydratedFired: string[] = [];
+
+	const fired = new Set<string>();
+
+	// 会话说目录固定在这里；环境变量只是为了让测试能指到临时目录
+	const log = new SessionLog(
+		process.env.COMMANDCODE_HUD_PROJECTS || join(homedir(), '.commandcode', 'projects'),
+	);
+
+	// ── 参数 ──
+	cmd.addFlag('ctx-limit', {type: 'string', description: '手动指定上下文上限（token 数）'});
+	cmd.addFlag('ctx-width', {type: 'string', description: '进度条宽度，默认 12'});
+	cmd.addFlag('ctx-bar', {type: 'string', description: '进度条字形：block（默认）或 ascii'});
+	cmd.addFlag('big-result-kb', {
+		type: 'string',
+		description: '工具结果超过多少 KB 就预警，默认 100，设 0 关闭',
+	});
+
+	function limit(): number {
+		const o = Number(cmd.getFlag('ctx-limit'));
+		if (Number.isFinite(o) && o > 0) return o;
+		return MODEL_CONTEXT[model] ?? FALLBACK_CONTEXT;
+	}
+
+	function width(): number {
+		const w = Number(cmd.getFlag('ctx-width'));
+		return Number.isFinite(w) && w >= 4 && w <= 40 ? Math.round(w) : 12;
+	}
+
+	function barStyle(): 'block' | 'ascii' {
+		return String(cmd.getFlag('ctx-bar') ?? '').toLowerCase() === 'ascii' ? 'ascii' : 'block';
+	}
+
+	function bigThreshold(): number {
+		const v = cmd.getFlag('big-result-kb');
+		if (v === undefined) return 100 * 1024;
+		const n = Number(v);
+		return Number.isFinite(n) && n >= 0 ? n * 1024 : 100 * 1024;
+	}
+
+	// 状态栏空间金贵，模型名只显示最后一段（deepseek/deepseek-v4.1-flash → deepseek-v4.1-flash）
+	function shortModel(full: string): string {
+		const s = clean(full, 40);
+		const i = s.lastIndexOf('/');
+		return clean(i >= 0 ? s.slice(i + 1) : s, 26);
+	}
+
+	// < 70% 绿　70–90% 黄　≥ 90% 红
+	function colorFor(ratio: number) {
+		if (ratio >= P_RED) return ANSI.red;
+		if (ratio >= P_YELLOW) return ANSI.yellow;
+		return ANSI.green;
+	}
+
+	function costNow(): number {
+		// 会话文件里的官方数字优先；读不到才退回估算
+		return log.found ? log.totalCost : estimatedCost;
+	}
+
+	// ── 持久化 ──
 	const HUD_STATE = 'commandcode-hud/state';
+	const HUD_PROBE = 'commandcode-hud/probe';
 
 	function hydrate(): void {
 		if (hydrated) return;
@@ -244,129 +446,134 @@ export default function (cmd: ModApi): void {
 			if (!last) return;
 			if (last.model) model = String(last.model);
 			if (last.effort) effort = String(last.effort);
-			if (Number.isFinite(last.contextTokens)) contextTokens = Number(last.contextTokens);
-			if (Number.isFinite(last.costUsd)) costUsd = Number(last.costUsd);
+			if (Number.isFinite(last.estimatedCost)) estimatedCost = Number(last.estimatedCost);
 			if (Number.isFinite(last.compactions)) compactions = Number(last.compactions);
-			// 已提醒过的档位一并恢复，否则 reload 后同一档会再响一次
-			if (Array.isArray(last.fired)) for (const k of last.fired) fired.add(String(k));
+			if (Number.isFinite(last.savedTotal)) savedTotal = Number(last.savedTotal);
+			if (Number.isFinite(last.bigResults)) bigResults = Number(last.bigResults);
+			if (Number.isFinite(last.bigChars)) bigChars = Number(last.bigChars);
+			if (Array.isArray(last.fired)) hydratedFired = last.fired.map(String);
 		} catch {
-			// 没有会话存储（--no-session / 单元测试）就安静跳过
+			// 没有会话存储（--no-session / 测试）：安静跳过
 		}
 	}
 
 	function persist(force = false): void {
-		if (!cmd.session) return; // 还没绑定：静默跳过
-		// 节流：模型调用很密，没必要每次都写
+		if (!cmd.session) return;
 		const now = Date.now();
 		if (!force && now - lastWriteAt < 30_000) return;
 		lastWriteAt = now;
 		try {
 			cmd.session.appendCustomEntry({
 				customType: HUD_STATE,
-				data: {model, effort, contextTokens, costUsd, compactions, fired: [...fired]},
+				data: {
+					model,
+					effort,
+					estimatedCost,
+					compactions,
+					savedTotal,
+					bigResults,
+					bigChars,
+					fired: [...new Set([...hydratedFired, ...fired])],
+				},
 			});
 			writes += 1;
 		} catch {
-			// 持久化失败不该影响会话。状态在 /hud 里能看到。
+			// 持久化失败不该影响会话；/hud 里能看到状态
 		}
 	}
 
-	// 允许手动覆盖上限（模型目录没收录 / 走 BYOK 时用）
-	cmd.addFlag('ctx-limit', {type: 'string', description: '手动指定上下文上限（token 数）'});
-	cmd.addFlag('ctx-width', {type: 'string', description: '进度条宽度，默认 12'});
-	cmd.addFlag('ctx-bar', {
-		type: 'string',
-		description: "进度条字形：block（█░，默认）或 ascii（#-，字体渲染不稳时用）",
-	});
-
-	function limit(): number {
-		const override = Number(cmd.getFlag('ctx-limit'));
-		if (Number.isFinite(override) && override > 0) return override;
-		return MODEL_CONTEXT[model] ?? FALLBACK_CONTEXT;
+	// /reload 之后拿不到 session id（argv 里没有，要等下一次 run_start）。
+	// 办法：写一条带唯一 token 的条目，再去找哪个会话文件收到了它 ——
+	// appendCustomEntry 落的就是当前会话的文件。只用最近几分钟改动过的文件，避免全盘扫。
+	function adoptSessionByProbe(): void {
+		if (!cmd.session) return;
+		const token = `adopt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		try {
+			cmd.session.appendCustomEntry({customType: HUD_PROBE, data: {token}});
+		} catch {
+			return;
+		}
+		try {
+			const cutoff = Date.now() - 5 * 60 * 1000;
+			const base = process.env.COMMANDCODE_HUD_PROJECTS || join(homedir(), '.commandcode', 'projects');
+			for (const slug of readdirSync(base)) {
+				let names: string[];
+				try {
+					names = readdirSync(join(base, slug));
+				} catch {
+					continue;
+				}
+				for (const name of names) {
+					if (!name.endsWith('.jsonl') || name.endsWith('.checkpoints.jsonl')) continue;
+					const p = join(base, slug, name);
+					try {
+						const st = statSync(p);
+						if (st.mtimeMs < cutoff || st.size === 0) continue;
+						// 只读尾部：探针条目刚写进去，一定在最后
+						const len = Math.min(st.size, 64 * 1024);
+						const fd = openSync(p, 'r');
+						const buf = Buffer.alloc(len);
+						readSync(fd, buf, 0, len, st.size - len);
+						closeSync(fd);
+						if (!buf.toString('utf8').includes(token)) continue;
+					} catch {
+						continue;
+					}
+					if (log.locate(name.replace(/\.jsonl$/, ''))) {
+						log.poll();
+						return;
+					}
+				}
+			}
+		} catch {
+			// 找不到就算了：下一次 run_start 会给 id
+		}
 	}
 
-	function width(): number {
-		const w = Number(cmd.getFlag('ctx-width'));
-		return Number.isFinite(w) && w >= 4 && w <= 40 ? Math.round(w) : 12;
-	}
-
-	// 状态栏空间金贵，模型名只显示最后一段（deepseek/deepseek-v4.1-flash → deepseek-v4.1-flash）。
-	// 完整 id 留给 /hud 命令，那里不差这点宽度。
-	function shortModel(full: string): string {
-		const s = clean(full, 40);
-		const i = s.lastIndexOf('/');
-		return clean(i >= 0 ? s.slice(i + 1) : s, 26);
-	}
-
-	function barStyle(): 'block' | 'ascii' {
-		return String(cmd.getFlag('ctx-bar') ?? '').toLowerCase() === 'ascii' ? 'ascii' : 'block';
-	}
-
-	// 事件里的 usage 不带 costUsd，按单价自己算。
-	// 口径：inputTokens 已含 cacheRead（OpenAI 口径），先拆出未缓存的部分，
-	// 否则缓存命中的 token 会被按全价再算一遍。
-	function estimateCost(u: any, m: string): number {
-		const p = MODEL_PRICE[m];
-		if (!p) return 0;
-		const input = Number(u?.inputTokens) || 0;
-		const read = Number(u?.cacheReadTokens) || 0;
-		const write = Number(u?.cacheWriteTokens) || 0;
-		const out = Number(u?.outputTokens) || 0;
-		const uncached = Math.max(0, input - read - write);
-		return (uncached * p.in + read * p.read + write * p.write + out * p.out) / 1_000_000;
-	}
-
-	// < 70% 绿　70–90% 黄　≥ 90% 红
-	function colorFor(ratio: number) {
-		if (ratio >= P_RED) return ANSI.red;
-		if (ratio >= P_YELLOW) return ANSI.yellow;
-		return ANSI.green;
-	}
-
+	// ── 渲染 ──
 	function render(): void {
-		if (!cmd.ui.capabilities.status) return; // 无头环境：不渲染
-		hydrate(); // reload / resume 后第一次渲染时把计数器捞回来
+		if (!cmd.ui.capabilities.status) return;
+		hydrate();
 
 		const lim = limit();
 		const ratio = lim > 0 ? contextTokens / lim : 0;
 		const paint = colorFor(ratio);
-
 		const parts: string[] = [];
 
-		// 1. 模型徽标
 		if (model) {
 			const tag = effort ? `${shortModel(model)}·${clean(effort, 8)}` : shortModel(model);
 			parts.push(ANSI.cyan(`[${tag}]`));
 		}
 
-		// 2. 上下文：进度条 + 百分比 + 绝对量
 		if (contextTokens > 0) {
-			const pct = `${Math.round(ratio * 100)}%`;
 			parts.push(
 				`${ANSI.dim('ctx')} ${paint(bar(ratio, width(), barStyle()))} ` +
-					`${paint(pct)} ${ANSI.dim(`${human(contextTokens)}/${human(lim)}`)}`,
+					`${paint(`${Math.round(ratio * 100)}%`)} ` +
+					ANSI.dim(`${human(contextTokens)}/${human(lim)}`),
 			);
 		} else {
 			parts.push(ANSI.dim('ctx —'));
 		}
 
-		// 3. 花费
-		if (costUsd > 0) parts.push(ANSI.dim(money(costUsd)));
+		const cost = costNow();
+		if (cost > 0) parts.push(ANSI.dim(money(cost)));
 
-		// 4. 压缩次数（静默杀手，必须可见）
-		if (compactions > 0) parts.push(ANSI.magenta(`⇄${compactions}`));
+		if (compactions > 0) {
+			// ③ 回收量；② 无效时打警告标
+			const saved = savedTotal > 0 ? ` −${human(savedTotal)}` : '';
+			const warn = lastCompactIneffective ? ' ⚠' : '';
+			parts.push(ANSI.magenta(`⇄${compactions}${saved}${warn}`));
+		}
 
-		// 5. 工具活动
 		if (currentTool) parts.push(ANSI.dim(`⚙ ${clean(currentTool, 18)}`));
 		else if (toolsThisRun > 0) parts.push(ANSI.dim(`⚙×${toolsThisRun}`));
 
-		// 6. 运行中标记
 		if (running) parts.push(ANSI.dim('…'));
 
 		cmd.ui.setStatus(parts.join(ANSI.dim(' │ ')));
 	}
 
-	// ── 阈值提醒（每个 session 每档只响一次）──
+	// ── 阈值提醒 ──
 	function checkThresholds(): void {
 		const lim = limit();
 		if (lim <= 0 || contextTokens <= 0) return;
@@ -375,18 +582,11 @@ export default function (cmd: ModApi): void {
 			if (ratio >= p && !fired.has(key)) {
 				fired.add(key);
 				cmd.ui.notify(msg);
+				persist(true);
 			}
 		};
-		hit(
-			P_WARN,
-			'warn',
-			`上下文已用 ${Math.round(ratio * 100)}%（${human(contextTokens)}/${human(lim)}）。`,
-		);
-		hit(
-			P_CRIT,
-			'crit',
-			`上下文 ${Math.round(ratio * 100)}%——建议现在 /compact，别等自动压缩。`,
-		);
+		hit(P_WARN, 'warn', `上下文已用 ${Math.round(ratio * 100)}%（${human(contextTokens)}/${human(lim)}）。`);
+		hit(P_CRIT, 'crit', `上下文 ${Math.round(ratio * 100)}%——建议现在 /compact，别等自动压缩。`);
 		hit(
 			P_DANGER,
 			'danger',
@@ -395,21 +595,89 @@ export default function (cmd: ModApi): void {
 		);
 	}
 
-	// ── 事件订阅（观察者，不改行为）──
+	// ── ① 大结果预警 ──
+	function inspectToolResult(toolName: string, result: unknown): void {
+		const threshold = bigThreshold();
+		if (threshold <= 0) return;
+
+		let size = 0;
+		let isImage = false;
+		try {
+			const s = JSON.stringify(result ?? '');
+			size = s.length;
+			isImage = s.includes('"type":"image"');
+		} catch {
+			return;
+		}
+		if (size < threshold) return;
+
+		bigResults += 1;
+		bigChars += size;
+
+		// 别刷屏：60 秒最多一条
+		const now = Date.now();
+		if (now - lastBigWarnAt < 60_000) return;
+		lastBigWarnAt = now;
+
+		const kb = Math.round(size / 1024);
+		const what = isImage ? '一张图片' : '一大段内容';
+		cmd.ui.notify(
+			`⚠️ ${clean(toolName, 20)} 返回了${what}（约 ${kb} KB）。这块会永久留在上下文里，` +
+				`不会被压缩回收；如果它落在压缩锚点上，还会让后续压缩彻底失效。`,
+		);
+	}
+
+	// ── ② 压缩健康度：压完之后真的降了吗 ──
+	function checkCompactionEffect(): void {
+		if (pendingCompactBefore <= 0) return;
+		const before = pendingCompactBefore;
+		pendingCompactBefore = 0;
+
+		if (before - contextTokens >= COMPACT_MIN_GAIN) {
+			ineffectiveCompactions = 0;
+			lastCompactIneffective = false;
+			return;
+		}
+
+		ineffectiveCompactions += 1;
+		lastCompactIneffective = true;
+		if (ineffectiveCompactions === COMPACT_INEFFECTIVE_ALERT && !fired.has('compact-dead')) {
+			fired.add('compact-dead');
+			cmd.ui.notify(
+				`🚨 压缩已经失效：连续 ${ineffectiveCompactions} 次压缩后上下文没有下降` +
+					`（${human(before)} → ${human(contextTokens)}）。` +
+					`通常是某块大内容把压缩锚点钉住了。再这样下去会直接撞上限，` +
+					`建议现在把成果落盘，然后 /clear 开新 session。`,
+			);
+		}
+	}
+
+	// ── 事件 ──
+	cmd.on('run_start', (e: any) => {
+		running = true;
+		toolsThisRun = 0;
+		if (e?.sessionId && log.locate(String(e.sessionId))) {
+			log.poll(); // 首次全量读，resume 也能立刻显示历史花费
+		}
+		render();
+	});
+
 	cmd.on('model_request_end', (e: any) => {
 		if (e?.model) model = String(e.model);
 		if (e?.effort) effort = String(e.effort);
 		const u = e?.usage ?? {};
-		// 上下文 = 本次请求的输入 + 本次产出。下一次请求的输入大致就是这个数，
-		// 所以这才是「再问一轮会占多少」的真实预估。
 		if (Number.isFinite(u.inputTokens)) {
 			contextTokens = Number(u.inputTokens) + (Number(u.outputTokens) || 0);
 		}
-		// 事件不带 costUsd，自己按单价算；万一以后带上了就优先用官方的
-		if (Number.isFinite(u.costUsd)) costUsd += Number(u.costUsd);
-		else costUsd += estimateCost(u, model);
-		persist(); // 节流后的落盘：模型调用是最频繁的可靠时点
+		if (!log.found) {
+			estimatedCost += Number.isFinite(u.costUsd)
+				? Number(u.costUsd)
+				: estimateCost(u, model);
+		}
+
+		checkCompactionEffect(); // ② 压缩后的第一笔请求，用来判断压缩有没有用
 		checkThresholds();
+		persist();
 		render();
 	});
 
@@ -418,9 +686,10 @@ export default function (cmd: ModApi): void {
 		render();
 	});
 
-	cmd.on('tool_completed', () => {
+	cmd.on('tool_completed', (e: any) => {
 		currentTool = null;
 		toolsThisRun += 1;
+		inspectToolResult(String(e?.toolName ?? '?'), e?.result);
 		render();
 	});
 
@@ -430,62 +699,79 @@ export default function (cmd: ModApi): void {
 		render();
 	});
 
-	cmd.on('compaction_done', () => {
-		compactions += 1;
-		persist();
+	cmd.on('compaction_start', () => {
+		pendingCompactBefore = contextTokens; // ② 记下压缩前的体积
 		render();
 	});
 
-	cmd.on('run_start', () => {
-		running = true;
-		toolsThisRun = 0;
+	cmd.on('compaction_done', (e: any) => {
+		compactions += 1;
+		if (Number.isFinite(e?.tokensSaved)) savedTotal += Number(e.tokensSaved); // ③
+		log.poll();
+		persist(true);
+		render();
+	});
+
+	cmd.on('turn_end', () => {
+		log.poll(); // 会话文件在每个 turn 提交后才有新内容
 		render();
 	});
 
 	cmd.on('run_end', () => {
 		running = false;
 		currentTool = null;
-		persist(true); // 每轮结束强制落一次
+		log.poll();
+		persist(true);
 		render();
 	});
 
 	// ── 会话生命周期 ──
 	cmd.hooks({
 		onSessionStart: () => {
-			hydrated = false; // 重新绑定：允许再捞一次（/reload 后就是这条路径）
+			hydrated = false;
 			hydrate();
+			for (const k of hydratedFired) fired.add(k);
+			// --resume 进来的会话：argv 里能捞到 id，先把历史花费读出来
+			const fromArgv = sessionIdFromArgv(process.argv);
+			if (fromArgv && log.locate(fromArgv)) log.poll();
+			else adoptSessionByProbe(); // /reload 的情况：靠探针反查
 			render();
 		},
 		onSessionEnd: () => cmd.ui.setStatus(null),
 	});
 
-	// ── 手动命令：立刻看一眼，或清空 ──
+	// ── 手动命令 ──
 	cmd.addCommand({
 		name: 'hud',
-		description: '显示/清空上下文 HUD（/hud off 清空）',
+		description: '显示上下文 HUD 详情（/hud off 清空状态栏）',
 		handler: ({args}: any) => {
-			const a = String(args ?? '').trim();
-			if (a === 'off') {
+			if (String(args ?? '').trim() === 'off') {
 				cmd.ui.setStatus(null);
 				return {message: 'HUD 已清空（下一轮会自动回来）'};
 			}
 			const lim = limit();
 			const ratio = lim > 0 ? contextTokens / lim : 0;
+			const cost = costNow();
+			const costSrc = log.found ? `官方（会话文件 ${log.requests} 笔）` : '本地估算（读不到会话文件）';
+			let readBack: number | string = 0;
+			try {
+				readBack = cmd.session?.getCustomEntries({customType: HUD_STATE}).length ?? 0;
+			} catch {
+				readBack = '?';
+			}
 			return {
 				message:
-					`${clean(model, 32) || '(未知模型)'}\n` +
+					`${clean(model, 40) || '(未知模型)'}${effort ? ` · ${clean(effort, 12)}` : ''}\n` +
 					`上下文 ${bar(ratio, 24, barStyle())} ${Math.round(ratio * 100)}%  ` +
 					`${human(contextTokens)} / ${human(lim)}\n` +
-					`累计花费 ${money(costUsd)}　压缩 ${compactions} 次　本轮工具 ${toolsThisRun} 次\n` +
-					`持久化 ${cmd.session ? '✅ 可用' : '❌ 未绑定'}　` +
-					`本进程写入 ${writes} 次　` +
-					`已读回 ${(() => {
-						try {
-							return cmd.session?.getCustomEntries({customType: HUD_STATE}).length ?? 0;
-						} catch {
-							return '?';
-						}
-					})()} 条`,
+					`花费 ${money(cost)}　来源：${costSrc}\n` +
+					`压缩 ${compactions} 次，累计回收 ${human(savedTotal)}` +
+					`${lastCompactIneffective ? '　⚠ 最近一次压缩没有回收' : ''}\n` +
+					`大结果 ${bigResults} 个，累计 ${human(bigChars)} 字符` +
+					`（阈值 ${Math.round(bigThreshold() / 1024)} KB）\n` +
+					`本轮工具 ${toolsThisRun} 次\n` +
+					`持久化 ${cmd.session ? '✅ 可用' : '❌ 未绑定'}　本进程写入 ${writes} 次　已读回 ${readBack} 条\n` +
+					`会话文件 ${log.found ? `✅ ${log.path}` : '❌ 未定位'}`,
 			};
 		},
 	});
