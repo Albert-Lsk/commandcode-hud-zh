@@ -4,7 +4,7 @@
 // 覆盖：事件渲染、阈值去重、未知模型回退、/hud 命令、/reload 状态恢复，
 //      以及四项新能力：① 大结果预警 ② 压缩健康度 ③ 压缩回收量 ④ 精确花费。
 
-import {appendFileSync, mkdtempSync, mkdirSync, writeFileSync} from 'node:fs';
+import {appendFileSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import hud from './hud.ts';
@@ -264,6 +264,14 @@ ok('极窄下只剩上下文（保底）', tiny.includes('%') && vis(cmd3.__stat
 flags['max-width'] = '120';
 process.stdout.emit('resize');
 ok('拉宽后信息恢复', strip(cmd3.__status).includes('$'));
+
+// ═══════════ 版本一致性（防止 package.json 与 mod 内的 VERSION 漂移）═══════════
+{
+	const modSrc = readFileSync('hud.ts', 'utf8');
+	const pkgJson = JSON.parse(readFileSync('package.json', 'utf8'));
+	const modVer = /const VERSION = '([^']+)'/.exec(modSrc)?.[1];
+	ok(`package.json 版本与 mod 一致（${modVer}）`, pkgJson.version === modVer);
+}
 
 // ═══════════ 汇总 ═══════════
 console.log('\n══ 结果 ══');
