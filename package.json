@@ -1,0 +1,28 @@
+{
+	"name": "commandcode-hud-cn",
+	"version": "0.1.0",
+	"description": "常驻在 Command Code 输入框下方的上下文仪表盘：上下文进度条、压缩次数、累计花费、工具活动，并在 70/85/90% 主动提醒。",
+	"keywords": [
+		"commandcode",
+		"commandcode-mod",
+		"hud",
+		"context-window",
+		"statusline"
+	],
+	"license": "MIT",
+	"type": "module",
+	"files": [
+		"hud.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"commandcode": {
+		"mods": [
+			"./hud.ts"
+		]
+	},
+	"scripts": {
+		"test": "node test-hud.ts",
+		"probe:color": "node tools/color-probe.ts"
+	}
+}
