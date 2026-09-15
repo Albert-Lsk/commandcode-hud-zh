@@ -42,6 +42,7 @@ process.env.COMMANDCODE_HUD_PROJECTS = FAKE_ROOT;
 
 type AnyFn = (...a: any[]) => void;
 const store: {customType: string; data?: any}[] = [];
+const flags: Record<string, string | undefined> = {};
 
 function makeCmd(hooksOut: any[], commandsOut: any[], noticesOut: string[]) {
 	const listeners = new Map<string, AnyFn[]>();
@@ -72,7 +73,7 @@ function makeCmd(hooksOut: any[], commandsOut: any[], noticesOut: string[]) {
 			return {dispose: () => {}};
 		},
 		addFlag: () => ({dispose: () => {}}),
-		getFlag: () => undefined,
+		getFlag: (n: string) => flags[n],
 		events: {emit: () => {}, on: () => ({dispose: () => {}})},
 		session: {
 			appendCustomEntry: (e: {customType: string; data?: any}) => {
@@ -210,6 +211,59 @@ ok('回填：上下文（不再是 ctx —）', !r2b.includes('ctx —') && r2b.
 ok('回填：模型名', r2b.includes('deepseek-v4.1-flash'));
 ok('/hud 打出版本号', /v\d+\.\d+\.\d+/.test(r.message));
 ok('/hud 给出宽度诊断', r.message.includes('终端') && r.message.includes('状态栏实宽'));
+
+// ═══════════ 终端宽度自适应 + resize 重算 ═══════════
+console.log('\n══ 宽度自适应（resize）══');
+const h3: any[] = [], c3: any[] = [], n3: string[] = [];
+const cmd3 = makeCmd(h3, c3, n3);
+hud(cmd3);
+h3[0].onSessionStart({source: 'startup'});
+cmd3.__fire('run_start', {sessionId: SID});
+cmd3.__fire('model_request_end', {
+	model: 'deepseek/deepseek-v4.1-flash', effort: 'max',
+	usage: {inputTokens: 570_000, outputTokens: 1_000, cacheReadTokens: 0, cacheWriteTokens: 0},
+});
+cmd3.__fire('compaction_done', {tokensSaved: 438_000});
+cmd3.__fire('tool_running', {toolName: 'read_file'});
+
+const vis = (s: string) => {
+	let w = 0;
+	for (const ch of strip(s)) {
+		const c = ch.codePointAt(0) ?? 0;
+		w += c >= 0x1100 && (c <= 0x115f || (c >= 0x2e80 && c <= 0xa4cf) ||
+			(c >= 0xff00 && c <= 0xff60) || (c >= 0x1f300 && c <= 0x1f64f)) ? 2 : 1;
+	}
+	return w;
+};
+
+// 宽窗口：全量信息
+flags['max-width'] = '120';
+cmd3.__fire('tool_completed', {toolName: 'read_file', result: 'ok'});
+cmd3.__fire('tool_running', {toolName: 'read_file'});
+const wide = strip(cmd3.__status);
+console.log(`  120 列  (${String(vis(cmd3.__status)).padStart(3)} 宽) │ ${wide}`);
+ok('宽窗口下信息齐全（含花费与工具）', wide.includes('$') && wide.includes('⚙'));
+
+// 压窄：靠 resize 事件触发重算
+flags['max-width'] = '44';
+process.stdout.emit('resize');
+const narrow = strip(cmd3.__status);
+console.log(`   44 列  (${String(vis(cmd3.__status)).padStart(3)} 宽) │ ${narrow}`);
+ok('resize 后自动降级（丢掉工具与花费）', !narrow.includes('⚙') && !narrow.includes('$'));
+ok('resize 后仍不超宽', vis(cmd3.__status) <= 44 - 2);
+ok('降级仍保住上下文百分比与压缩标记', /\d+%/.test(narrow) && narrow.includes('⇄'));
+
+// 极窄：只剩百分比
+flags['max-width'] = '20';
+process.stdout.emit('resize');
+const tiny = strip(cmd3.__status);
+console.log(`   20 列  (${String(vis(cmd3.__status)).padStart(3)} 宽) │ ${tiny}`);
+ok('极窄下只剩上下文（保底）', tiny.includes('%') && vis(cmd3.__status) <= 20 - 2);
+
+// 拉回宽：信息应恢复
+flags['max-width'] = '120';
+process.stdout.emit('resize');
+ok('拉宽后信息恢复', strip(cmd3.__status).includes('$'));
 
 // ═══════════ 汇总 ═══════════
 console.log('\n══ 结果 ══');

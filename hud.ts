@@ -163,7 +163,7 @@ const MODEL_PRICE: Record<string, Price> = {
 
 // 版本号：改功能就 +1。`/hud` 会打出来，用来确认内存里到底跑的是哪一版
 // （mods 每个进程只加载一次，/reload 之前一直在跑旧代码，光看磁盘是看不出来的）。
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 
 const FALLBACK_CONTEXT = 1_048_576;
 
@@ -405,9 +405,10 @@ export default function (cmd: ModApi): void {
 	let bigChars = 0;
 	let lastBigWarnAt = 0;
 
-	// 诊断用：最近一次渲染的实宽与预算
+	// 诊断用：最近一次渲染的实宽、预算、以及当时探测到的终端列数
 	let lastRenderedWidth = 0;
 	let lastBudget = 0;
+	let lastCols = 0;
 
 	// 持久化
 	let writes = 0;
@@ -490,6 +491,35 @@ export default function (cmd: ModApi): void {
 	function costNow(): number {
 		// 会话文件里的官方数字优先；读不到才退回估算
 		return log.found ? log.totalCost : estimatedCost;
+	}
+
+	// ── 终端尺寸变化 ──
+	//
+	// 状态栏只在事件触发时刷新，而「拖动窗口」不是事件。不监听 resize 的话，
+	// 把窗口压窄之后 HUD 会一直停在上一次的宽度上，然后被宿主截断 ——
+	// 诊断里会看到「可用列数 > 终端列数」这种不可能的值。
+	let resizeHandler: (() => void) | null = null;
+
+	function attachResize(): void {
+		const out: any = process.stdout;
+		if (!out || typeof out.on !== 'function' || resizeHandler) return;
+		resizeHandler = () => render();
+		try {
+			out.on('resize', resizeHandler);
+		} catch {
+			resizeHandler = null;
+		}
+	}
+
+	function detachResize(): void {
+		const out: any = process.stdout;
+		if (!out || !resizeHandler) return;
+		try {
+			out.off?.('resize', resizeHandler);
+		} catch {
+			// 摘不掉也无所谓，进程本来就要结束了
+		}
+		resizeHandler = null;
 	}
 
 	// ── 持久化 ──
@@ -661,6 +691,7 @@ export default function (cmd: ModApi): void {
 		// 所以真正可用的内容宽度是「终端列数 − 2」，而不是终端列数。
 		// 早先按 −1 算，窄窗口下会照样被截掉尾巴。
 		const cols = columns();
+		lastCols = cols;
 		let out: string;
 		if (cols <= 0) {
 			out = build(LADDER[0]); // 探测不到宽度（无头/管道）：不裁
@@ -847,9 +878,13 @@ export default function (cmd: ModApi): void {
 			if (fromArgv && log.locate(fromArgv)) log.poll();
 			else adoptSessionByProbe(); // /reload 的情况：靠探针反查
 			syncFromLog();
+			attachResize();
 			render();
 		},
-		onSessionEnd: () => cmd.ui.setStatus(null),
+		onSessionEnd: () => {
+			detachResize();
+			cmd.ui.setStatus(null);
+		},
 	});
 
 	// ── 手动命令 ──
@@ -883,7 +918,7 @@ export default function (cmd: ModApi): void {
 					`（阈值 ${Math.round(bigThreshold() / 1024)} KB）\n` +
 					`本轮工具 ${toolsThisRun} 次\n` +
 					`持久化 ${cmd.session ? '✅ 可用' : '❌ 未绑定'}　本进程写入 ${writes} 次　已读回 ${readBack} 条\n` +
-					`v${VERSION}　终端 ${columns() || '未探测'} 列　可用 ${lastBudget || '未探测'} 列　` +
+					`v${VERSION}　终端 ${columns() || '未探测'} 列　上次渲染按 ${lastCols || '未探测'} 列算　可用 ${lastBudget || '未探测'} 列　` +
 					`状态栏实宽 ${lastRenderedWidth} 列　` +
 					`${
 						lastBudget <= 0
