@@ -268,14 +268,19 @@ ok('拉宽后信息恢复', strip(cmd3.__status).includes('$'));
 // ═══════════ 隐私：只显示统计，不带出工具返回的原文 ═══════════
 {
 	const canary = 'SYNTHETIC_PRIVATE_TOOL_BODY_DO_NOT_ECHO';
-	cmd1.__fire('tool_completed', {
+	const privacyHooks: any[] = [], privacyCommands: any[] = [], privacyNotices: string[] = [];
+	const privacyCmd = makeCmd(privacyHooks, privacyCommands, privacyNotices);
+	hud(privacyCmd);
+	privacyHooks[0].onSessionStart({source: 'startup'});
+	privacyCmd.__fire('tool_completed', {
 		toolName: 'read_file',
 		result: [{type: 'text', text: canary.repeat(4096)}],
 	});
-	cmd1.__fire('run_end', {});
-	const diagnostic = c1.find((x) => x.name === 'hud').handler({args: ''});
-	const exposed = JSON.stringify([cmd1.__status, n1, store, diagnostic.message]);
-	ok('隐私：工具返回原文不进入状态栏、通知或持久化数据', !exposed.includes(canary));
+	privacyCmd.__fire('run_end', {});
+	const diagnostic = privacyCommands.find((x) => x.name === 'hud').handler({args: ''});
+	const exposed = JSON.stringify([privacyCmd.__status, privacyNotices, store, diagnostic.message]);
+	// 使用新实例，确保预警实际触发，不受前面的 60 秒节流影响。
+	ok('隐私：工具返回原文不进入状态栏、通知或持久化数据', privacyNotices.length === 1 && !exposed.includes(canary));
 }
 
 // ═══════════ 版本一致性（防止 package.json 与 mod 内的 VERSION 漂移）═══════════
