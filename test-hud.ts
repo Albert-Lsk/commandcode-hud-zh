@@ -265,6 +265,19 @@ flags['max-width'] = '120';
 process.stdout.emit('resize');
 ok('拉宽后信息恢复', strip(cmd3.__status).includes('$'));
 
+// ═══════════ 隐私：只显示统计，不带出工具返回的原文 ═══════════
+{
+	const canary = 'SYNTHETIC_PRIVATE_TOOL_BODY_DO_NOT_ECHO';
+	cmd1.__fire('tool_completed', {
+		toolName: 'read_file',
+		result: [{type: 'text', text: canary.repeat(4096)}],
+	});
+	cmd1.__fire('run_end', {});
+	const diagnostic = c1.find((x) => x.name === 'hud').handler({args: ''});
+	const exposed = JSON.stringify([cmd1.__status, n1, store, diagnostic.message]);
+	ok('隐私：工具返回原文不进入状态栏、通知或持久化数据', !exposed.includes(canary));
+}
+
 // ═══════════ 版本一致性（防止 package.json 与 mod 内的 VERSION 漂移）═══════════
 {
 	const modSrc = readFileSync('hud.ts', 'utf8');

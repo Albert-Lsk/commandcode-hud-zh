@@ -1,5 +1,29 @@
 # commandcode-hud
 
+## English overview
+
+A Chinese-language, single-line context HUD for Command Code. It shows context usage, session spend, compaction count and reclaimed tokens, and the active tool. It warns about large tool results and ineffective compaction, and adapts its layout when the terminal is resized.
+
+Install from the public GitHub repository:
+
+```bash
+cmd mods add Albert-Lsk/commandcode-hud-zh
+```
+
+Then `/reload` or start a new session. Use `/hud` for details. Notifications and diagnostic messages are in Chinese.
+
+Synthetic preview — these values are examples, not a real session:
+
+```text
+[deepseek-v4.1-flash·high] │ ctx ███████████░ 95% 996k/1.0M │ $0.204 │ ⇄2 −438k │ ⚙ read_file
+```
+
+Cost comes from the current session transcript when it can be located; otherwise the HUD falls back to a bundled price-table estimate. Context limits also come from a bundled model table and can be overridden with `--mod-option ctx-limit=...`.
+
+The mod makes no network requests and does not read authentication files. It reads local session usage and stores HUD counters through the session API; it does not persist tool-result bodies. Tests use synthetic session files. Before sharing `/hud` output, redact the session file path, model name, and usage figures if they are private.
+
+## 中文说明
+
 常驻在输入面板下方的**上下文仪表盘**。参照 [jarrodwatts/claude-hud](https://github.com/jarrodwatts/claude-hud) 的思路，改用 Command Code 的 ModApi 实现。
 
 **它解决的痛点**：上下文溢出是**静默发生**的。自动压缩会悄悄跑很多次，界面上没有任何提示，直到某一条消息直接报 400 —— 而且此时 `continue` 只会让情况更糟。这个 mod 把那个盲区补上。
@@ -68,7 +92,7 @@ cmd mods list
 #   commandcode-hud · user · ~/.commandcode/mods/commandcode-hud.ts
 ```
 
-**临时禁用**：删掉 `~/.commandcode/mods/commandcode-hud.ts` 即可，不用重启。
+**禁用手动安装的版本**：删除 `~/.commandcode/mods/commandcode-hud.ts` 后 `/reload` 或重启会话，使当前进程卸载它。
 
 ## 用法
 
@@ -96,7 +120,7 @@ cmd mods list
 
 ## 两个从实测里挖出来的坑
 
-**1. 事件里的 `usage` 没有 `costUsd`。** 会话日志里的 usage 带 `costUsd`，但 `model_request_end` 事件不带。所以花费是**本地按单价算的**（定价表同样从随包模型目录生成，70 个模型）。口径：`inputTokens` 已含 `cacheRead`（OpenAI 口径），先拆出未缓存部分再计价，否则缓存命中的 token 会被按全价重复计算。若将来事件补上 `costUsd`，会优先用官方的。
+**1. 开发时的 `model_request_end` 事件不带 `costUsd`。** HUD 优先读取当前会话日志中的 `usage.costUsd`；无法定位会话文件时，才按随包价目表估算。如果事件提供 `costUsd`，会优先采用该值作为无会话文件时的兜底。`/hud` 会标明花费来源。估算口径中 `inputTokens` 已含 `cacheRead`（OpenAI 口径），先拆出缓存部分再计价，避免重复收费计算。
 
 **2. `cmd.session` 在 factory 执行时是 `undefined`**，要等 host 绑定（`onSessionStart`）之后才有。所以读写都必须是**懒加载**，不能在 factory 顶层取。
 
@@ -164,7 +188,7 @@ cmd --mod ./hud.ts
 /reload
 ```
 
-`test-hud.ts` 走的是 `hud.ts` 里真实的渲染与阈值逻辑（17 项断言），改完跑一遍就知道有没有回归。
+`test-hud.ts` 走的是 `hud.ts` 里真实的渲染与阈值逻辑（30 项断言），包括工具返回正文不进入状态栏、通知或持久化数据的隐私检查。
 
 **只写可擦除语法。** Node 的类型剥离（strip-only）不支持参数属性、enum、namespace、装饰器 —— 用了会直接抛 `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`，`node test-hud.ts` 就跑不起来。全文件目前只用可擦除语法，这是刻意的。
 
@@ -183,7 +207,7 @@ R=~/.npm-global/lib/node_modules/command-code/dist/bundled/command-code-knowledg
 
 - **不用 `cmd.hooks` 改任何行为** —— 纯观察者（`cmd.on`），只读事件，不拦截工具、不改上下文。装它不会影响 agent 的决策。
 - **无网络请求。** 只读事件负载和本地模型表。
-- **mod 没有沙箱** —— 这是任意代码。这个文件只有 300 行，可以直接读完。
+- **mod 没有沙箱** —— 这是任意代码。渲染、事件监听、会话统计与模型表都在 `hud.ts` 中，可以直接检查源码。
 - 日志别用 `console.log`：会污染 TUI。要调试就用 `cmd.ui.notify`，或跑 `test-hud.ts`。
 
 ## 许可
