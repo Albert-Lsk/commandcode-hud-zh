@@ -2,3 +2,6 @@ node_modules/
 .DS_Store
 *.log
 .commandcode/
+
+# 内部草稿，不进公开仓库
+.drafts/

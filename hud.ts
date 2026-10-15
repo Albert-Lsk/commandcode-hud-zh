@@ -11,11 +11,12 @@
 //   ② 压缩健康度   —— 压完之后上下文有没有真的下降（没降 = 压缩已失效）
 //   ③ 压缩回收量   —— 压缩到底救回了多少
 //   ④ 精确花费     —— 直接读会话文件里 CLI 自己算的 costUsd
+//   ⑤ 请求体预警   —— 活跃链字节量（图片占大头）逼近网关 502 区间前预警
 //
 // 刻意不做：不 patch CLI 的 dist、不读 auth.json、不联网。
 
 import type {ModApi} from '@commandcode/harness';
-import {closeSync, existsSync, openSync, readSync, readdirSync, statSync} from 'node:fs';
+import {closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync} from 'node:fs';
 import {join} from 'node:path';
 import {homedir} from 'node:os';
 
@@ -163,7 +164,7 @@ const MODEL_PRICE: Record<string, Price> = {
 
 // 版本号：改功能就 +1。`/hud` 会打出来，用来确认内存里到底跑的是哪一版
 // （mods 每个进程只加载一次，/reload 之前一直在跑旧代码，光看磁盘是看不出来的）。
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 
 const FALLBACK_CONTEXT = 1_048_576;
 
@@ -183,6 +184,16 @@ const COMPACT_MIN_GAIN = 5_000;
 // 连续这么多次无效就报警
 const COMPACT_INEFFECTIVE_ALERT = 2;
 
+// ── ⑤ 请求体预警（502）──
+// 实测：23.1MB 的请求体（90% 是图片）被网关以 502 掐断，重试同样失败；
+// 13.7MB 起本机已有案例，公开复现口径是序列化后「roughly 20 MB+」开始断流。
+// 估算口径 = 会话日志活跃链字节和 + 固定开销（系统提示 / 工具 schema / 请求字段，标定值）。
+const REQUEST_OVERHEAD = 1.3 * 1048576;
+const P_PAY_LIMIT_MB = 23; // 红线（--mod-option payload-limit-mb 可改）
+const P_PAY_FLOOR = 0.1; // 显示门槛 = 10% 红线（≈2.3MB）
+const P_PAY_WARN = 0.65; // 转黄 / 首次提醒（≈15MB）
+const P_PAY_CRIT = 0.87; // 转红 / 二次提醒（≈20MB）
+
 const ANSI = {
 	dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
 	green: (s: string) => `\x1b[32m${s}\x1b[0m`,
@@ -191,6 +202,156 @@ const ANSI = {
 	magenta: (s: string) => `\x1b[35m${s}\x1b[0m`,
 	cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
 };
+
+// ─────────────────────────────────────────────────────────────
+// 多语言
+//
+// 解析顺序：--mod-option lang=zh|en  >  Command Code 的界面语言设置
+// （~/.commandcode/config.json 的 language；Settings → Interface language 或 /language 改它）
+// >  默认 zh。mods 每个进程只加载一次：改完设置 /reload（或开新会话）后生效。
+// ─────────────────────────────────────────────────────────────
+const TEXT = {
+	zh: {
+		hudCleared: 'HUD 已清空（下一轮会自动回来）',
+		flagCtxLimit: '手动指定上下文上限（token 数）',
+		flagCtxWidth: '进度条宽度，默认 12',
+		flagCtxBar: '进度条字形：block（默认）或 ascii',
+		flagMaxWidth: '状态栏可用列数，默认自动探测终端宽度',
+		flagBigResult: '工具结果超过多少 KB 就预警，默认 100，设 0 关闭',
+		flagPayload: '请求体红线（MB），默认 23；显示/黄/红档位按 10%/65%/87% 等比缩放，设 0 关闭',
+		cmdDesc: '显示上下文 HUD 详情（/hud off 清空状态栏）',
+		unknownModel: '(未知模型)',
+		notDetected: '未探测',
+		ctxLine: (barText: string, pct: string, used: string, lim: string) =>
+			`上下文 ${barText} ${pct}%  ${used} / ${lim}`,
+		costLine: (money: string, src: string) => `花费 ${money}　来源：${src}`,
+		costOfficial: (n: number) => `官方（会话文件 ${n} 笔）`,
+		costLocal: '本地估算（读不到会话文件）',
+		compactionsLine: (n: number, saved: string) => `压缩 ${n} 次，累计回收 ${saved}`,
+		lastCompactBad: '　⚠ 最近一次压缩没有回收',
+		bigResultsLine: (n: number, chars: string, kb: number) => `大结果 ${n} 个，累计 ${chars} 字符（阈值 ${kb} KB）`,
+		payloadLine: (total: string, content: string, fixed: string) => `请求体 ≈ ${total}（内容 ${content} ＋ 固定 ${fixed}）`,
+		payloadImages: (n: number, mbv: string) => `　图片 ${n} 张 · ${mbv}`,
+		payloadNoFile: '——（未定位会话文件）',
+		payScaleLine: (lim: number, f: number, w: number, c: number) => `请求体红线 ${lim}MB　显示 ${f}% / 黄 ${w}% / 红 ${c}%`,
+		toolsLine: (n: number) => `本轮工具 ${n} 次`,
+		persistLine: (ok: string, writes: number, readBack: number | string) => `持久化 ${ok}　本进程写入 ${writes} 次　已读回 ${readBack} 条`,
+		persistOk: '✅ 可用',
+		persistNo: '❌ 未绑定',
+		diagNoWidth: '（探测不到宽度，不裁）',
+		diagOver: '⚠ 超宽会被截断',
+		diagFits: '✅ 不超宽',
+		diagLine: (
+			ver: string,
+			cols: number | string,
+			lastCols: number | string,
+			budget: number | string,
+			width: number,
+			note: string,
+		) => `v${ver}　终端 ${cols} 列　上次渲染按 ${lastCols} 列算　可用 ${budget} 列　状态栏实宽 ${width} 列　${note}`,
+		sessionOk: (path: string) => `会话文件 ✅ ${path}`,
+		sessionNo: '会话文件 ❌ 未定位',
+		ctxWarn: (pct: number, used: string, lim: string) => `上下文已用 ${pct}%（${used}/${lim}）。`,
+		ctxCrit: (pct: number) => `上下文 ${pct}%——建议现在 /compact，别等自动压缩。`,
+		ctxDanger: (pct: number) =>
+			`上下文 ${pct}%，接近上限。自动压缩的锚点一旦被大附件钉住就会失效，建议把成果落盘后 /clear 开新 session（或用 /rewind 回到爆点之前）。`,
+		imgsPart: (n: number, mbv: string) => `（图片 ${n} 张 · ${mbv}）`,
+		payWarn: (mbv: string, imgs: string) =>
+			`📦 请求体估算 ≈ ${mbv}${imgs}。实测 13.7MB 起就有 502 案例——别再加截图了；多图会话建议先落盘再 /compact。`,
+		payCrit: (mbv: string, imgs: string) =>
+			`⚠️ 请求体估算 ≈ ${mbv}${imgs}。公开复现口径：序列化后「roughly 20 MB+」开始断流；建议把成果落盘，现在 /compact 再继续。`,
+		payDanger: (mbv: string, imgs: string) =>
+			`🚨 请求体估算 ≈ ${mbv}${imgs} —— 已到实测 502 尺寸（23.1MB 的请求 90% 是图片，曾被网关掐断且重试连炸）。立即 /compact，或落盘后 /clear 开新会话。`,
+		bigWhatImage: '一张图片',
+		bigWhatBlob: '一大段内容',
+		bigResult: (tool: string, what: string, kb: number) =>
+			`⚠️ ${tool} 返回了${what}（约 ${kb} KB）。这块会永久留在上下文里，不会被压缩回收；如果它落在压缩锚点上，还会让后续压缩彻底失效。`,
+		compactDead: (n: number, before: string, after: string) =>
+			`🚨 压缩已经失效：连续 ${n} 次压缩后上下文没有下降（${before} → ${after}）。通常是某块大内容把压缩锚点钉住了。再这样下去会直接撞上限，建议现在把成果落盘，然后 /clear 开新 session。`,
+		gateway: (mbv: string) =>
+			`⚠️ 模型请求失败重试（疑似 502 断流）。当前请求体 ≈ ${mbv}，相同体积重试通常还会失败——建议先 /compact，再从断点继续。`,
+	},
+	en: {
+		hudCleared: 'HUD cleared (it returns on the next turn)',
+		flagCtxLimit: 'Manually set the context limit (tokens)',
+		flagCtxWidth: 'Bar width, default 12',
+		flagCtxBar: 'Bar style: block (default) or ascii',
+		flagMaxWidth: 'Usable columns for the status line (auto-detected by default)',
+		flagBigResult: 'Warn when a tool result exceeds this many KB (default 100; 0 disables)',
+		flagPayload: 'Request-body red line in MB (default 23); show/yellow/red scale by 10%/65%/87%; 0 disables',
+		cmdDesc: 'Show context HUD details (/hud off clears the status line)',
+		unknownModel: '(unknown model)',
+		notDetected: 'n/a',
+		ctxLine: (barText: string, pct: string, used: string, lim: string) =>
+			`Context ${barText} ${pct}%  ${used} / ${lim}`,
+		costLine: (money: string, src: string) => `Cost ${money}  source: ${src}`,
+		costOfficial: (n: number) => `official (${n} entries in the session file)`,
+		costLocal: 'local estimate (session file not found)',
+		compactionsLine: (n: number, saved: string) => `Compactions ${n}, reclaimed ${saved}`,
+		lastCompactBad: '  ⚠ last compaction reclaimed nothing',
+		bigResultsLine: (n: number, chars: string, kb: number) => `Large results ${n}, ${chars} chars total (threshold ${kb} KB)`,
+		payloadLine: (total: string, content: string, fixed: string) => `Request ≈ ${total} (content ${content} + fixed ${fixed})`,
+		payloadImages: (n: number, mbv: string) => `  images ${n} · ${mbv}`,
+		payloadNoFile: '— (session file not located)',
+		payScaleLine: (lim: number, f: number, w: number, c: number) => `Red line ${lim}MB  show ${f}% / yellow ${w}% / red ${c}%`,
+		toolsLine: (n: number) => `Tools this run: ${n}`,
+		persistLine: (ok: string, writes: number, readBack: number | string) => `Persistence ${ok}  writes ${writes}  read back ${readBack}`,
+		persistOk: '✅ bound',
+		persistNo: '❌ not bound',
+		diagNoWidth: '(width not detected - no trimming)',
+		diagOver: '⚠ will be truncated',
+		diagFits: '✅ fits',
+		diagLine: (
+			ver: string,
+			cols: number | string,
+			lastCols: number | string,
+			budget: number | string,
+			width: number,
+			note: string,
+		) => `v${ver}  terminal ${cols} cols  last render ${lastCols} cols  budget ${budget}  status width ${width}  ${note}`,
+		sessionOk: (path: string) => `Session file ✅ ${path}`,
+		sessionNo: 'Session file ❌ not located',
+		ctxWarn: (pct: number, used: string, lim: string) => `Context usage at ${pct}% (${used}/${lim}).`,
+		ctxCrit: (pct: number) => `Context at ${pct}% — run /compact now instead of waiting for auto-compaction.`,
+		ctxDanger: (pct: number) =>
+			`Context at ${pct}%, near the limit. Once a large attachment pins the compaction anchor, auto-compaction stops working — save your work, then /clear (or /rewind past the blow-up).`,
+		imgsPart: (n: number, mbv: string) => ` (${n} images · ${mbv})`,
+		payWarn: (mbv: string, imgs: string) =>
+			`📦 Estimated request size ≈ ${mbv}${imgs}. 502s have started at 13.7MB in practice — avoid adding more screenshots; save your work and /compact early.`,
+		payCrit: (mbv: string, imgs: string) =>
+			`⚠️ Estimated request size ≈ ${mbv}${imgs}. Public repro: streams cut from "roughly 20 MB+" serialized — save your work and /compact before continuing.`,
+		payDanger: (mbv: string, imgs: string) =>
+			`🚨 Estimated request size ≈ ${mbv}${imgs} — the measured 502 size (23.1MB, 90% images; identical retries failed too). Run /compact now, or save your work and /clear.`,
+		bigWhatImage: 'an image',
+		bigWhatBlob: 'a large result',
+		bigResult: (tool: string, what: string, kb: number) =>
+			`⚠️ ${tool} returned ${what} (~${kb} KB). It stays in the context permanently and is never reclaimed by compaction; if it lands on the compaction anchor, it breaks future compactions entirely.`,
+		compactDead: (n: number, before: string, after: string) =>
+			`🚨 Compaction has failed: context did not drop after ${n} consecutive compactions (${before} → ${after}). A large block is pinning the anchor. Save your work and start fresh with /clear before you hit the limit.`,
+		gateway: (mbv: string) =>
+			`⚠️ Model request failed and is retrying (likely the 502 stream cut). Current request ≈ ${mbv} — the same payload usually keeps failing; /compact first, then continue.`,
+	},
+};
+type Lang = keyof typeof TEXT;
+
+function normalizeLang(v: unknown): Lang | '' {
+	const s = String(v ?? '').trim().toLowerCase();
+	if (!s) return '';
+	if (s.startsWith('zh')) return 'zh';
+	if (s.startsWith('en')) return 'en';
+	return '';
+}
+
+// 跟随 Command Code 的界面语言设置（config.json 的 language）
+function configLanguage(): string {
+	try {
+		const p = process.env.COMMANDCODE_HUD_CONFIG || join(homedir(), '.commandcode', 'config.json');
+		const j = JSON.parse(readFileSync(p, 'utf8'));
+		return typeof j?.language === 'string' ? j.language : '';
+	} catch {
+		return '';
+	}
+}
 
 // ─────────────────────────────────────────────────────────────
 // 纯函数
@@ -218,6 +379,13 @@ function human(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_048_576).toFixed(1)}M`;
 	if (n >= 1_000) return `${Math.round(n / 1000)}k`;
 	return String(Math.round(n));
+}
+
+// 字节读数：小于 1MB 用 KB，避免几百字节被 toFixed(1) 吃成 0.0MB
+function mb(n: number): string {
+	if (!Number.isFinite(n) || n <= 0) return '0MB';
+	if (n < 1_048_576) return `${Math.max(1, Math.round(n / 1024))}KB`;
+	return `${(n / 1_048_576).toFixed(1)}MB`;
 }
 
 // 可见宽度：先剥掉 ANSI，再把全角字符按 2 列算。
@@ -258,13 +426,26 @@ function estimateCost(u: any, model: string): number {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 会话文件增量读取（精确花费）
+// 会话文件增量读取（精确花费 + ⑤ 请求体估算）
 //
 // mod 拿不到当前 session id，但 run_start 会给出；文件名就是 <id>.jsonl，
 // 放在 ~/.commandcode/projects/<slug>/ 下。直接扫目录比推算 slug 稳。
 // 会话文件里每条 assistant 记录带 CLI 自己算的 usage.costUsd —— 那是官方数字，
 // 比本地按价目表估算准，而且不会随模型目录漂移。
+//
+// 文件同时是一棵 append-only 的树（每条记录带 id/parentId）：压缩不重写日志，
+// 只追加一条 {type:'compaction', firstKeptEntryId}；模型看到的就是「最近一条
+// 链上压缩标记起的活跃链」。⑤ 的字节估算只统计活跃链，旁支不计。
 // ─────────────────────────────────────────────────────────────
+type RecMeta = {
+	parent: string;
+	bytes: number;
+	compact: boolean;
+	fk: string;
+	imgBytes: number;
+	imgCount: number;
+};
+
 class SessionLog {
 	// 注意：这里不用 TS 的参数属性简写（constructor(private base: string)）。
 	// Node 的类型剥离（strip-only）不支持它，会直接抛 ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX，
@@ -280,6 +461,15 @@ class SessionLog {
 	lastModel = '';
 	lastEffort = '';
 	lastContext = 0;
+	// ⑤：活跃链索引（id → 记录元信息）与字节统计
+	recs = new Map<string, RecMeta>();
+	lastId = '';
+	totalBytes = 0;
+	totalImgBytes = 0;
+	totalImgCount = 0;
+	ctxBytes = 0;
+	imgBytes = 0;
+	imgCount = 0;
 
 	constructor(base: string) {
 		this.base = base;
@@ -299,6 +489,14 @@ class SessionLog {
 					this.lastModel = '';
 					this.lastEffort = '';
 					this.lastContext = 0;
+					this.recs.clear();
+					this.lastId = '';
+					this.totalBytes = 0;
+					this.totalImgBytes = 0;
+					this.totalImgCount = 0;
+					this.ctxBytes = 0;
+					this.imgBytes = 0;
+					this.imgCount = 0;
 					return true;
 				}
 			}
@@ -317,6 +515,14 @@ class SessionLog {
 				// 文件被换掉或截断：从头重来
 				this.offset = 0;
 				this.carry = '';
+				this.recs.clear();
+				this.lastId = '';
+				this.totalBytes = 0;
+				this.totalImgBytes = 0;
+				this.totalImgCount = 0;
+				this.ctxBytes = 0;
+				this.imgBytes = 0;
+				this.imgCount = 0;
 			}
 			if (size === this.offset) return false;
 
@@ -330,8 +536,32 @@ class SessionLog {
 			this.carry = lines.pop() ?? ''; // 最后一段可能是半行
 			for (const line of lines) {
 				if (!line.trim()) continue;
+				const bytes = Buffer.byteLength(line, 'utf8');
+				this.totalBytes += bytes;
+				// 图片只会是内联 base64；先按行扫一遍（比整行 JSON 深挖便宜）
+				let imgBytes = 0;
+				let imgCount = 0;
+				if (/"type"\s*:\s*"image"/.test(line)) {
+					imgCount = (line.match(/"type"\s*:\s*"image"/g) ?? []).length;
+					const re = /"data"\s*:\s*"([A-Za-z0-9+/=]+)"/g;
+					let mm: RegExpExecArray | null;
+					while ((mm = re.exec(line))) imgBytes += mm[1].length;
+					this.totalImgBytes += imgBytes;
+					this.totalImgCount += imgCount;
+				}
 				try {
 					const rec = JSON.parse(line);
+					if (typeof rec?.id === 'string' && rec.id) {
+						this.recs.set(rec.id, {
+							parent: typeof rec.parentId === 'string' ? rec.parentId : '',
+							bytes,
+							compact: rec.type === 'compaction',
+							fk: typeof rec.firstKeptEntryId === 'string' ? rec.firstKeptEntryId : '',
+							imgBytes,
+							imgCount,
+						});
+						this.lastId = rec.id;
+					}
 					const u = rec?.usage;
 					if (!u) continue;
 					if (Number.isFinite(u.costUsd)) {
@@ -351,6 +581,51 @@ class SessionLog {
 		} catch {
 			return false;
 		}
+	}
+
+	// ⑤ 计算模型当前看到的上下文字节数（活跃链 + 压缩边界）与图片占比。
+	// 语义来自 harness 的 buildContextEntriesFromPath：
+	//   无链上压缩 → 根到叶整条链；
+	//   有链上压缩 → 最近一条 compaction 的 firstKeptEntryId（含）到叶。
+	refreshContext(leafHint: string): void {
+		const leaf = leafHint && this.recs.has(leafHint) ? leafHint : this.lastId;
+		if (!leaf || !this.recs.has(leaf)) {
+			// 没有 id 链（旧日志 / 测试桩）：退回全文件字节和
+			this.ctxBytes = this.totalBytes;
+			this.imgBytes = this.totalImgBytes;
+			this.imgCount = this.totalImgCount;
+			return;
+		}
+		const chain: string[] = [];
+		const seen = new Set<string>();
+		for (let id = leaf; id && this.recs.has(id) && !seen.has(id); id = this.recs.get(id)!.parent) {
+			seen.add(id);
+			chain.push(id);
+		}
+		let mIdx = -1;
+		for (let i = 0; i < chain.length; i++) {
+			if (this.recs.get(chain[i])!.compact) {
+				mIdx = i;
+				break;
+			}
+		}
+		let end = chain.length - 1;
+		if (mIdx >= 0) {
+			const fkIdx = chain.indexOf(this.recs.get(chain[mIdx])!.fk);
+			end = fkIdx > mIdx ? fkIdx : mIdx;
+		}
+		let b = 0;
+		let ib = 0;
+		let ic = 0;
+		for (let i = 0; i <= end; i++) {
+			const m = this.recs.get(chain[i])!;
+			b += m.bytes;
+			ib += m.imgBytes;
+			ic += m.imgCount;
+		}
+		this.ctxBytes = b;
+		this.imgBytes = ib;
+		this.imgCount = ic;
 	}
 
 	get found(): boolean {
@@ -410,6 +685,10 @@ export default function (cmd: ModApi): void {
 	let lastBudget = 0;
 	let lastCols = 0;
 
+	// ⑤ 请求体估算（字节，含固定开销）
+	let payloadBytes = 0;
+	let gatewayNotified = false;
+
 	// 持久化
 	let writes = 0;
 	let lastWriteAt = 0;
@@ -423,16 +702,34 @@ export default function (cmd: ModApi): void {
 	);
 
 	// ── 参数 ──
-	cmd.addFlag('ctx-limit', {type: 'string', description: '手动指定上下文上限（token 数）'});
-	cmd.addFlag('ctx-width', {type: 'string', description: '进度条宽度，默认 12'});
-	cmd.addFlag('ctx-bar', {type: 'string', description: '进度条字形：block（默认）或 ascii'});
+	cmd.addFlag('lang', {
+		type: 'string',
+		description: 'zh | en — 默认跟随 Command Code 界面语言（defaults to the app interface language）',
+	});
+
+	// 语言：--mod-option lang=  >  界面语言设置（config.json）  >  默认 zh
+	function detectLang(): Lang {
+		return normalizeLang(cmd.getFlag('lang')) || normalizeLang(configLanguage()) || 'zh';
+	}
+	let LANG: Lang = detectLang();
+	function T() {
+		return TEXT[LANG];
+	}
+
+	cmd.addFlag('ctx-limit', {type: 'string', description: T().flagCtxLimit});
+	cmd.addFlag('ctx-width', {type: 'string', description: T().flagCtxWidth});
+	cmd.addFlag('ctx-bar', {type: 'string', description: T().flagCtxBar});
 	cmd.addFlag('max-width', {
 		type: 'string',
-		description: '状态栏可用列数，默认自动探测终端宽度',
+		description: T().flagMaxWidth,
 	});
 	cmd.addFlag('big-result-kb', {
 		type: 'string',
-		description: '工具结果超过多少 KB 就预警，默认 100，设 0 关闭',
+		description: T().flagBigResult,
+	});
+	cmd.addFlag('payload-limit-mb', {
+		type: 'string',
+		description: T().flagPayload,
 	});
 
 	function limit(): number {
@@ -463,6 +760,31 @@ export default function (cmd: ModApi): void {
 		if (v === undefined) return 100 * 1024;
 		const n = Number(v);
 		return Number.isFinite(n) && n >= 0 ? n * 1024 : 100 * 1024;
+	}
+
+	function payLimit(): number {
+		const v = cmd.getFlag('payload-limit-mb');
+		if (v === undefined) return P_PAY_LIMIT_MB * 1048576;
+		const n = Number(v);
+		return Number.isFinite(n) && n >= 0 ? n * 1048576 : P_PAY_LIMIT_MB * 1048576;
+	}
+
+	// ⑤：leafId() 拿得到就信它（/rewind 之后活跃叶不一定等于最后一条记录）
+	function activeLeaf(): string {
+		try {
+			const l = (cmd as any).sessions?.leafId?.();
+			return typeof l === 'string' ? l : '';
+		} catch {
+			return '';
+		}
+	}
+
+	function refreshPayload(): void {
+		if (log.found) {
+			log.refreshContext(activeLeaf());
+			payloadBytes = log.ctxBytes > 0 ? log.ctxBytes + REQUEST_OVERHEAD : 0;
+		}
+		checkPayload();
 	}
 
 	// 把会话文件里读到的状态填进来。只填"还没有"的字段：
@@ -540,6 +862,7 @@ export default function (cmd: ModApi): void {
 			if (Number.isFinite(last.savedTotal)) savedTotal = Number(last.savedTotal);
 			if (Number.isFinite(last.bigResults)) bigResults = Number(last.bigResults);
 			if (Number.isFinite(last.bigChars)) bigChars = Number(last.bigChars);
+			if (Number.isFinite(last.payloadBytes)) payloadBytes = Number(last.payloadBytes);
 			if (Array.isArray(last.fired)) hydratedFired = last.fired.map(String);
 		} catch {
 			// 没有会话存储（--no-session / 测试）：安静跳过
@@ -562,6 +885,7 @@ export default function (cmd: ModApi): void {
 					savedTotal,
 					bigResults,
 					bigChars,
+					payloadBytes: Math.round(payloadBytes),
 					fired: [...new Set([...hydratedFired, ...fired])],
 				},
 			});
@@ -655,6 +979,14 @@ export default function (cmd: ModApi): void {
 			: toolsThisRun > 0
 				? ANSI.dim(`⚙×${toolsThisRun}`)
 				: '';
+		const payLim = payLimit();
+		const payRatio = payLim > 0 ? payloadBytes / payLim : 0;
+		const paySeg =
+			payloadBytes > 0 && payRatio >= P_PAY_FLOOR
+				? (payRatio >= P_PAY_CRIT ? ANSI.red : payRatio >= P_PAY_WARN ? ANSI.yellow : ANSI.green)(
+						`📦 ${mb(payloadBytes)}`,
+					)
+				: '';
 
 		const ctxSeg = (bw: number, withTokens: boolean): string => {
 			if (contextTokens <= 0) return ANSI.dim('ctx —');
@@ -669,6 +1001,7 @@ export default function (cmd: ModApi): void {
 			const parts: string[] = [];
 			if (l.show.includes('model') && modelSeg) parts.push(modelSeg);
 			parts.push(ctxSeg(l.barWidth, l.tokens));
+			if (l.show.includes('payload') && paySeg) parts.push(paySeg);
 			if (l.show.includes('cost') && costSeg) parts.push(costSeg);
 			if (l.show.includes('compact') && compactSeg) parts.push(compactSeg);
 			if (l.show.includes('tool') && toolSeg) parts.push(toolSeg);
@@ -678,12 +1011,13 @@ export default function (cmd: ModApi): void {
 
 		const w = width();
 		const LADDER: Layout[] = [
-			{barWidth: w, tokens: true, show: ['model', 'cost', 'compact', 'tool']},
-			{barWidth: w, tokens: true, show: ['model', 'cost', 'compact']},
-			{barWidth: w, tokens: true, show: ['model', 'compact']},
-			{barWidth: 8, tokens: true, show: ['model', 'compact']},
-			{barWidth: 8, tokens: false, show: ['model', 'compact']},
-			{barWidth: 6, tokens: false, show: ['compact']},
+			{barWidth: w, tokens: true, show: ['model', 'cost', 'compact', 'tool', 'payload']},
+			{barWidth: w, tokens: true, show: ['model', 'cost', 'compact', 'payload']},
+			{barWidth: w, tokens: true, show: ['model', 'compact', 'payload']},
+			{barWidth: 8, tokens: true, show: ['model', 'compact', 'payload']},
+			{barWidth: 8, tokens: false, show: ['model', 'compact', 'payload']},
+			{barWidth: 6, tokens: false, show: ['compact', 'payload']},
+			{barWidth: 6, tokens: false, show: ['payload']},
 			{barWidth: 5, tokens: false, show: []},
 		];
 
@@ -725,14 +1059,26 @@ export default function (cmd: ModApi): void {
 				persist(true);
 			}
 		};
-		hit(P_WARN, 'warn', `上下文已用 ${Math.round(ratio * 100)}%（${human(contextTokens)}/${human(lim)}）。`);
-		hit(P_CRIT, 'crit', `上下文 ${Math.round(ratio * 100)}%——建议现在 /compact，别等自动压缩。`);
-		hit(
-			P_DANGER,
-			'danger',
-			`上下文 ${Math.round(ratio * 100)}%，接近上限。自动压缩的锚点一旦被大附件钉住就会失效，` +
-				`建议把成果落盘后 /clear 开新 session（或用 /rewind 回到爆点之前）。`,
-		);
+		hit(P_WARN, 'warn', T().ctxWarn(Math.round(ratio * 100), human(contextTokens), human(lim)));
+		hit(P_CRIT, 'crit', T().ctxCrit(Math.round(ratio * 100)));
+		hit(P_DANGER, 'danger', T().ctxDanger(Math.round(ratio * 100)));
+	}
+
+	// ── ⑤ 请求体预警（502）──
+	function checkPayload(): void {
+		const lim = payLimit();
+		if (lim <= 0 || payloadBytes <= 0) return;
+		const imgs = log.imgCount > 0 ? T().imgsPart(log.imgCount, mb(log.imgBytes)) : '';
+		const hit = (ratio: number, key: string, msg: string) => {
+			if (payloadBytes >= lim * ratio && !fired.has(key)) {
+				fired.add(key);
+				cmd.ui.notify(msg);
+				persist(true);
+			}
+		};
+		hit(P_PAY_WARN, 'payload-warn', T().payWarn(mb(payloadBytes), imgs));
+		hit(P_PAY_CRIT, 'payload-crit', T().payCrit(mb(payloadBytes), imgs));
+		hit(1, 'payload-danger', T().payDanger(mb(payloadBytes), imgs));
 	}
 
 	// ── ① 大结果预警 ──
@@ -760,11 +1106,8 @@ export default function (cmd: ModApi): void {
 		lastBigWarnAt = now;
 
 		const kb = Math.round(size / 1024);
-		const what = isImage ? '一张图片' : '一大段内容';
-		cmd.ui.notify(
-			`⚠️ ${clean(toolName, 20)} 返回了${what}（约 ${kb} KB）。这块会永久留在上下文里，` +
-				`不会被压缩回收；如果它落在压缩锚点上，还会让后续压缩彻底失效。`,
-		);
+		const what = isImage ? T().bigWhatImage : T().bigWhatBlob;
+		cmd.ui.notify(T().bigResult(clean(toolName, 20), what, kb));
 	}
 
 	// ── ② 压缩健康度：压完之后真的降了吗 ──
@@ -783,12 +1126,7 @@ export default function (cmd: ModApi): void {
 		lastCompactIneffective = true;
 		if (ineffectiveCompactions === COMPACT_INEFFECTIVE_ALERT && !fired.has('compact-dead')) {
 			fired.add('compact-dead');
-			cmd.ui.notify(
-				`🚨 压缩已经失效：连续 ${ineffectiveCompactions} 次压缩后上下文没有下降` +
-					`（${human(before)} → ${human(contextTokens)}）。` +
-					`通常是某块大内容把压缩锚点钉住了。再这样下去会直接撞上限，` +
-					`建议现在把成果落盘，然后 /clear 开新 session。`,
-			);
+			cmd.ui.notify(T().compactDead(ineffectiveCompactions, human(before), human(contextTokens)));
 		}
 	}
 
@@ -799,9 +1137,37 @@ export default function (cmd: ModApi): void {
 		if (e?.sessionId && log.locate(String(e.sessionId))) {
 			log.poll(); // 首次全量读：resume 也能立刻显示历史花费与上下文
 			syncFromLog();
+			refreshPayload();
 		}
 		render();
 	});
+
+	cmd.on('model_request_start', () => {
+		// ⑤ 请求发出前的最后一眼：会话文件里的新记录此时都已经落盘
+		log.poll();
+		refreshPayload();
+		render();
+	});
+
+	// ⑤ 事后确认：真的打上重试/断流时，把「就是体积」这层怀疑直接说出来。
+	// 502 是客户端合成的（流没等到 finish 事件），重试通常同样失败——
+	// 这时体积读数已经足够大，值得立刻把成果落盘再 /compact。
+	function gatewayEvidence(e: any): void {
+		if (gatewayNotified) return;
+		let blob = String(e ?? '');
+		try {
+			blob += ` ${JSON.stringify(e ?? '')}`;
+		} catch {
+			// 序列化失败就不挑
+		}
+		if (!/502|Stream ended|truncat/i.test(blob)) return;
+		if (payloadBytes <= 0 || payloadBytes < payLimit() * P_PAY_FLOOR) return;
+		gatewayNotified = true;
+		cmd.ui.notify(T().gateway(mb(payloadBytes)));
+	}
+	cmd.on('api_retry', (e: any) => gatewayEvidence(e));
+	cmd.on('stream_restart', (e: any) => gatewayEvidence(e));
+	cmd.on('run_error', (e: any) => gatewayEvidence(e));
 
 	cmd.on('model_request_end', (e: any) => {
 		if (e?.model) model = String(e.model);
@@ -818,6 +1184,7 @@ export default function (cmd: ModApi): void {
 
 		checkCompactionEffect(); // ② 压缩后的第一笔请求，用来判断压缩有没有用
 		checkThresholds();
+		refreshPayload();
 		persist();
 		render();
 	});
@@ -849,6 +1216,7 @@ export default function (cmd: ModApi): void {
 		compactions += 1;
 		if (Number.isFinite(e?.tokensSaved)) savedTotal += Number(e.tokensSaved); // ③
 		log.poll();
+		refreshPayload(); // 压缩标记刚落盘：⑤ 的读数应该立刻降下来
 		persist(true);
 		render();
 	});
@@ -856,6 +1224,7 @@ export default function (cmd: ModApi): void {
 	cmd.on('turn_end', () => {
 		log.poll(); // 会话文件在每个 turn 提交后才有新内容
 		syncFromLog();
+		refreshPayload();
 		render();
 	});
 
@@ -863,6 +1232,7 @@ export default function (cmd: ModApi): void {
 		running = false;
 		currentTool = null;
 		log.poll();
+		refreshPayload();
 		persist(true);
 		render();
 	});
@@ -870,6 +1240,7 @@ export default function (cmd: ModApi): void {
 	// ── 会话生命周期 ──
 	cmd.hooks({
 		onSessionStart: () => {
+			LANG = detectLang();
 			hydrated = false;
 			hydrate();
 			for (const k of hydratedFired) fired.add(k);
@@ -878,6 +1249,7 @@ export default function (cmd: ModApi): void {
 			if (fromArgv && log.locate(fromArgv)) log.poll();
 			else adoptSessionByProbe(); // /reload 的情况：靠探针反查
 			syncFromLog();
+			refreshPayload();
 			attachResize();
 			render();
 		},
@@ -890,44 +1262,62 @@ export default function (cmd: ModApi): void {
 	// ── 手动命令 ──
 	cmd.addCommand({
 		name: 'hud',
-		description: '显示上下文 HUD 详情（/hud off 清空状态栏）',
+		description: T().cmdDesc,
 		handler: ({args}: any) => {
 			if (String(args ?? '').trim() === 'off') {
 				cmd.ui.setStatus(null);
-				return {message: 'HUD 已清空（下一轮会自动回来）'};
+				return {message: T().hudCleared};
 			}
 			const lim = limit();
 			const ratio = lim > 0 ? contextTokens / lim : 0;
 			const cost = costNow();
-			const costSrc = log.found ? `官方（会话文件 ${log.requests} 笔）` : '本地估算（读不到会话文件）';
+			const costSrc = log.found ? T().costOfficial(log.requests) : T().costLocal;
 			let readBack: number | string = 0;
 			try {
 				readBack = cmd.session?.getCustomEntries({customType: HUD_STATE}).length ?? 0;
 			} catch {
 				readBack = '?';
 			}
+			const diagNote =
+				lastBudget <= 0 ? T().diagNoWidth : lastRenderedWidth > lastBudget ? T().diagOver : T().diagFits;
 			return {
 				message:
-					`${clean(model, 40) || '(未知模型)'}${effort ? ` · ${clean(effort, 12)}` : ''}\n` +
-					`上下文 ${bar(ratio, 24, barStyle())} ${Math.round(ratio * 100)}%  ` +
-					`${human(contextTokens)} / ${human(lim)}\n` +
-					`花费 ${money(cost)}　来源：${costSrc}\n` +
-					`压缩 ${compactions} 次，累计回收 ${human(savedTotal)}` +
-					`${lastCompactIneffective ? '　⚠ 最近一次压缩没有回收' : ''}\n` +
-					`大结果 ${bigResults} 个，累计 ${human(bigChars)} 字符` +
-					`（阈值 ${Math.round(bigThreshold() / 1024)} KB）\n` +
-					`本轮工具 ${toolsThisRun} 次\n` +
-					`持久化 ${cmd.session ? '✅ 可用' : '❌ 未绑定'}　本进程写入 ${writes} 次　已读回 ${readBack} 条\n` +
-					`v${VERSION}　终端 ${columns() || '未探测'} 列　上次渲染按 ${lastCols || '未探测'} 列算　可用 ${lastBudget || '未探测'} 列　` +
-					`状态栏实宽 ${lastRenderedWidth} 列　` +
-					`${
-						lastBudget <= 0
-							? '（探测不到宽度，不裁）'
-							: lastRenderedWidth > lastBudget
-								? '⚠ 超宽会被截断'
-								: '✅ 不超宽'
-					}\n` +
-					`会话文件 ${log.found ? `✅ ${log.path}` : '❌ 未定位'}`,
+					`${clean(model, 40) || T().unknownModel}${effort ? ` · ${clean(effort, 12)}` : ''}\n` +
+					T().ctxLine(bar(ratio, 24, barStyle()), String(Math.round(ratio * 100)), human(contextTokens), human(lim)) +
+					'\n' +
+					T().costLine(money(cost), costSrc) +
+					'\n' +
+					T().compactionsLine(compactions, human(savedTotal)) +
+					(lastCompactIneffective ? T().lastCompactBad : '') +
+					'\n' +
+					T().bigResultsLine(bigResults, human(bigChars), Math.round(bigThreshold() / 1024)) +
+					'\n' +
+					(log.found
+						? T().payloadLine(mb(payloadBytes), mb(log.ctxBytes), mb(REQUEST_OVERHEAD)) +
+							T().payloadImages(log.imgCount, mb(log.imgBytes))
+						: T().payloadNoFile) +
+					'\n' +
+					T().payScaleLine(
+						Math.round(payLimit() / 1048576),
+						Math.round(P_PAY_FLOOR * 100),
+						Math.round(P_PAY_WARN * 100),
+						Math.round(P_PAY_CRIT * 100),
+					) +
+					'\n' +
+					T().toolsLine(toolsThisRun) +
+					'\n' +
+					T().persistLine(cmd.session ? T().persistOk : T().persistNo, writes, readBack) +
+					'\n' +
+					T().diagLine(
+						VERSION,
+						columns() || T().notDetected,
+						lastCols || T().notDetected,
+						lastBudget || T().notDetected,
+						lastRenderedWidth,
+						diagNote,
+					) +
+					'\n' +
+					(log.found ? T().sessionOk(log.path) : T().sessionNo),
 			};
 		},
 	});

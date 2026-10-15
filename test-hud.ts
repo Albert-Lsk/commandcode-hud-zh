@@ -2,7 +2,8 @@
 // 跑法：node test-hud.ts
 //
 // 覆盖：事件渲染、阈值去重、未知模型回退、/hud 命令、/reload 状态恢复，
-//      以及四项新能力：① 大结果预警 ② 压缩健康度 ③ 压缩回收量 ④ 精确花费。
+//      以及五项新能力：① 大结果预警 ② 压缩健康度 ③ 压缩回收量 ④ 精确花费 ⑤ 请求体预警；
+//      多语言：默认 zh，跟随 Command Code 界面语言（config.json），--mod-option lang= 覆盖。
 
 import {appendFileSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -39,6 +40,7 @@ writeSession([
 	{costUsd: 0.25, inputTokens: 300_000},
 ]);
 process.env.COMMANDCODE_HUD_PROJECTS = FAKE_ROOT;
+process.env.COMMANDCODE_HUD_CONFIG = join(FAKE_ROOT, 'no-such-config.json'); // 语言探测保持确定性（默认 zh）
 
 type AnyFn = (...a: any[]) => void;
 const store: {customType: string; data?: any}[] = [];
@@ -281,6 +283,163 @@ ok('拉宽后信息恢复', strip(cmd3.__status).includes('$'));
 	const exposed = JSON.stringify([privacyCmd.__status, privacyNotices, store, diagnostic.message]);
 	// 使用新实例，确保预警实际触发，不受前面的 60 秒节流影响。
 	ok('隐私：工具返回原文不进入状态栏、通知或持久化数据', privacyNotices.length === 1 && !exposed.includes(canary));
+}
+
+// ═══════════ 会话 4：⑤ 请求体预警（502）═══════════
+console.log('\n══ 会话 4：请求体预警 ══');
+{
+	const SID2 = '11111111-2222-3333-4444-555555555555';
+	const dir4 = join(FAKE_ROOT, 'fake-slug');
+	const raw4: string[] = [];
+	const line4 = (o: unknown) => JSON.stringify(o);
+	const txt4 = (id: string, parent: string, pad: number) =>
+		line4({
+			type: 'message', id, parentId: parent, timestamp: 0,
+			message: {role: 'user', content: [{type: 'text', text: 'x'.repeat(pad)}]},
+		});
+	const img4 = (id: string, parent: string, kb: number) =>
+		line4({
+			type: 'message', id, parentId: parent, timestamp: 0,
+			message: {role: 'user', content: [{type: 'tool_result', tool_use_id: 't', content: [
+				{type: 'image', source: {type: 'base64', media_type: 'image/jpeg', data: 'A'.repeat(kb * 1024)}},
+			]}]},
+		});
+	const write4 = () => writeFileSync(join(dir4, `${SID2}.jsonl`), raw4.join('\n') + '\n');
+
+	raw4.push(line4({type: 'session', version: 3, id: 'sess', timestamp: 0, cwd: '/tmp'}));
+	raw4.push(txt4('m1', 'sess', 400));
+	raw4.push(txt4('m2', 'm1', 400));
+	raw4.push(txt4('side9', 'm2', 900 * 1024)); // DAG 旁支：写进文件，但不在活跃链上
+	raw4.push(line4({
+		type: 'compaction', id: 'c1', parentId: 'm2', timestamp: 0,
+		summary: 'S'.repeat(900), firstKeptEntryId: 'm2', tokensBefore: 50000,
+	}));
+	raw4.push(txt4('m3', 'c1', 400));
+	write4();
+
+	flags['payload-limit-mb'] = '15'; // 红线 15MB：显示 1.5 / 黄 9.75 / 红 13.05
+	const h4: any[] = [], c4: any[] = [], n4: string[] = [];
+	const cmd4 = makeCmd(h4, c4, n4);
+	hud(cmd4);
+	h4[0].onSessionStart({source: 'startup'});
+	cmd4.__fire('run_start', {sessionId: SID2});
+
+	const s4 = () => strip(cmd4.__status);
+	const expCtx = (...ids: string[]) =>
+		raw4
+			.filter((l) => ids.some((id) => l.includes(`"id":"${id}"`)))
+			.reduce((s, l) => s + Buffer.byteLength(l, 'utf8'), 0);
+	const expMb = (ctx: number) => `${((ctx + 1.3 * 1048576) / 1048576).toFixed(1)}MB`;
+	const payCount = (mark: string) => n4.filter((m) => m.includes(mark)).length;
+
+	// 起始内容很小 → 低于显示门槛（10% × 15MB = 1.5MB）
+	ok('⑤ 低于门槛不显示', !s4().includes('📦'));
+
+	// +4MB 图片 → 约 5.2MB：转绿显示，无提醒；旁支的 900KB 不得计入
+	raw4.push(img4('m4', 'm3', 4000));
+	write4();
+	cmd4.__fire('turn_end');
+	const ctxA = expCtx('m2', 'c1', 'm3', 'm4');
+	ok('⑤ 估算按活跃链算（旁支不计）', s4().includes(`📦 ${expMb(ctxA)}`));
+	ok('⑤ 绿档不提醒', n4.length === 0);
+
+	// +5.3MB → 约 10.4MB ≥ 65%（9.75MB）：黄档提醒
+	raw4.push(img4('m5', 'm4', 5300));
+	write4();
+	cmd4.__fire('turn_end');
+	ok('⑤ 黄档提醒一次', payCount('📦 请求体估算') === 1);
+
+	// +3.2MB → 约 13.5MB ≥ 87%（13.05MB）：红档提醒
+	raw4.push(img4('m6', 'm5', 3200));
+	write4();
+	cmd4.__fire('turn_end');
+	ok('⑤ 红档提醒一次', payCount('⚠️ 请求体估算') === 1);
+
+	// +2.2MB → 约 15.7MB ≥ 红线：危险提醒
+	raw4.push(img4('m7', 'm6', 2200));
+	write4();
+	cmd4.__fire('turn_end');
+	ok('⑤ 红线提醒一次', payCount('🚨 请求体估算') === 1);
+	show('⑤ 红线读数', cmd4.__status);
+
+	// 网关真在重试 502：点名体积（每个会话只喊一次）
+	const retry = {attempt: 3, delayMs: 10_000, error: {status: 502, message: 'Stream ended unexpectedly before completion'}};
+	cmd4.__fire('api_retry', retry);
+	cmd4.__fire('api_retry', retry);
+	ok('⑤ 重试时点名 502（只喊一次）', n4.filter((m) => m.includes('失败重试')).length === 1);
+	for (const m of n4) console.log(`  📣 ${m}`);
+
+	// /hud 明细
+	const r4: any = c4.find((x) => x.name === 'hud').handler({args: ''});
+	ok('/hud 打出请求体与图片明细', r4.message.includes('请求体 ≈') && r4.message.includes('图片 4 张'));
+	ok('/hud 打出请求体红线', r4.message.includes('请求体红线 15MB'));
+
+	// /rewind 之后活跃叶不再等于最后一条记录：leafId() 优先
+	(cmd4 as any).sessions = {leafId: () => 'm2'};
+	cmd4.__fire('turn_end');
+	ok('⑤ leafId 校正后回到门槛之下', !s4().includes('📦'));
+	delete (cmd4 as any).sessions;
+	cmd4.__fire('turn_end');
+	ok('⑤ 恢复活跃叶后读数回来', s4().includes('📦'));
+
+	// /reload：已提醒过的档位不重复响，读数靠持久化 + 重算回填
+	const h6: any[] = [], c6: any[] = [], n6: string[] = [];
+	const cmd6 = makeCmd(h6, c6, n6);
+	hud(cmd6);
+	h6[0].onSessionStart({source: 'startup'});
+	cmd6.__fire('run_start', {sessionId: SID2});
+	ok('⑤ reload 后不重复提醒', n6.filter((m) => m.includes('请求体估算')).length === 0);
+	ok('⑤ reload 后回填读数', strip(cmd6.__status).includes('📦'));
+
+	delete flags['payload-limit-mb'];
+}
+
+// ═══════════ 会话 5：多语言（lang=en / 跟随界面语言）═══════════
+console.log('\n══ 会话 5：多语言 ══');
+{
+	// ① --mod-option lang=en
+	flags['lang'] = 'en';
+	const h7: any[] = [], c7: any[] = [], n7: string[] = [];
+	const cmd7 = makeCmd(h7, c7, n7);
+	hud(cmd7);
+	h7[0].onSessionStart({source: 'startup'});
+	cmd7.__fire('tool_completed', {
+		toolName: 'read_file',
+		result: [{type: 'text', text: 'x'.repeat(300 * 1024)}],
+	});
+	ok('en：大结果提醒是英文', n7.some((m) => m.includes('returned') && m.includes('compaction anchor')));
+	const r7: any = c7.find((x) => x.name === 'hud').handler({args: ''});
+	ok('en：/hud 是英文', r7.message.includes('Context ') && r7.message.includes('Red line'));
+	delete flags['lang'];
+
+	// ② 跟随 Command Code 界面语言（config.json 的 language=en）
+	const cfgEn = join(FAKE_ROOT, 'cfg-en.json');
+	writeFileSync(cfgEn, JSON.stringify({language: 'en'}));
+	process.env.COMMANDCODE_HUD_CONFIG = cfgEn;
+	const h8: any[] = [], c8: any[] = [], n8: string[] = [];
+	const cmd8 = makeCmd(h8, c8, n8);
+	hud(cmd8);
+	h8[0].onSessionStart({source: 'startup'});
+	cmd8.__fire('tool_completed', {
+		toolName: 'read_file',
+		result: [{type: 'text', text: 'x'.repeat(300 * 1024)}],
+	});
+	ok('en：跟随界面语言（config.json）', n8.some((m) => m.includes('returned')));
+
+	// ③ 配置切回 zh：新实例应回到中文
+	const cfgZh = join(FAKE_ROOT, 'cfg-zh.json');
+	writeFileSync(cfgZh, JSON.stringify({language: 'zh'}));
+	process.env.COMMANDCODE_HUD_CONFIG = cfgZh;
+	const h9: any[] = [], c9: any[] = [], n9: string[] = [];
+	const cmd9 = makeCmd(h9, c9, n9);
+	hud(cmd9);
+	h9[0].onSessionStart({source: 'startup'});
+	cmd9.__fire('tool_completed', {
+		toolName: 'read_file',
+		result: [{type: 'text', text: 'x'.repeat(300 * 1024)}],
+	});
+	ok('zh：跟随界面语言回到中文', n9.some((m) => m.includes('返回了')));
+	process.env.COMMANDCODE_HUD_CONFIG = join(FAKE_ROOT, 'no-such-config.json');
 }
 
 // ═══════════ 版本一致性（防止 package.json 与 mod 内的 VERSION 漂移）═══════════
